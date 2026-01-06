@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """
-Benchmark Matrix Runner for ISHMEM vs NaiveAll2All
+Benchmark Matrix Runner for ISHMEM vs NaiveAll2All vs AgRsAll2All
 
 This script runs benchmarks across multiple configurations and generates
 a summary table in Markdown and CSV formats.
 
 Usage:
-    cd /home/sdp/hanchao/symm
-    source env.sh
-    mpirun -n 2 python torch_ishmem_extension/run_benchmark_matrix.py
-    mpirun -n 4 python torch_ishmem_extension/run_benchmark_matrix.py
+    mpirun -n 2 python torch_ishmem_extension/run_benchmark_matrix.py --preset full --no-xpu-events
+    mpirun -n 4 python torch_ishmem_extension/run_benchmark_matrix.py --preset full --no-xpu-events
+    mpirun -n 8 python torch_ishmem_extension/run_benchmark_matrix.py --preset full --no-xpu-events
 """
 
 import os
@@ -86,6 +85,59 @@ class NaiveAll2AllManager:
 
 
 # =====================================================
+# AgRsAll2AllManager - AllGather/ReduceScatter based
+# =====================================================
+class AgRsAll2AllManager:
+    """
+    An implementation of all2all communication based on
+    all-gather (dispatch) and reduce-scatter (combine).
+    This is the approach used in vLLM's AgRsAll2AllManager.
+    """
+    def __init__(self, group=None):
+        self.group = group
+        self.rank = rank
+        self.world_size = world_size
+
+    def dispatch(self, hidden_states: torch.Tensor, sizes: list[int]) -> torch.Tensor:
+        """
+        Gather hidden_states from all ranks using all_gather_into_tensor.
+        
+        Input: hidden_states [local_tokens, hidden_dim]
+        Output: gathered [total_tokens, hidden_dim]
+        """
+        device = hidden_states.device
+        dtype = hidden_states.dtype
+        hidden_dim = hidden_states.shape[1]
+        local_tokens = hidden_states.shape[0]
+        
+        # For simplicity, assume all ranks have same size (sizes are equal)
+        # Use all_gather_into_tensor for efficiency
+        total_tokens = local_tokens * self.world_size
+        output = torch.empty(total_tokens, hidden_dim, dtype=dtype, device=device)
+        
+        dist.all_gather_into_tensor(output, hidden_states.contiguous(), group=self.group)
+        
+        return output
+
+    def combine(self, hidden_states: torch.Tensor, sizes: list[int]) -> torch.Tensor:
+        """
+        Reduce-scatter hidden_states across all ranks.
+        
+        Input: hidden_states [total_tokens, hidden_dim]
+        Output: local_hidden [local_tokens, hidden_dim]
+        """
+        total_tokens = hidden_states.shape[0]
+        hidden_dim = hidden_states.shape[1]
+        local_tokens = total_tokens // self.world_size
+        
+        output = torch.empty(local_tokens, hidden_dim, dtype=hidden_states.dtype, device=hidden_states.device)
+        
+        dist.reduce_scatter_tensor(output, hidden_states.contiguous(), group=self.group)
+        
+        return output
+
+
+# =====================================================
 # ISHMEMDispatcher - ISHMEM all_to_all_vdev_2d based
 # =====================================================
 class ISHMEMDispatcher:
@@ -153,7 +205,7 @@ def setup_distributed():
 
 
 def run_single_benchmark(num_tokens, hidden_dim, num_experts, device, group_name, 
-                         warmup=5, iterations=20):
+                         warmup=5, iterations=20, use_xpu_events=True):
     """Run a single benchmark configuration and return results."""
     dtype = torch.bfloat16
     nsplits = num_experts * world_size
@@ -174,11 +226,18 @@ def run_single_benchmark(num_tokens, hidden_dim, num_experts, device, group_name
     input_tensor = torch.randn(local_tokens, hidden_dim, dtype=dtype, device=device)
     sizes = [local_tokens] * world_size
     
-    # Create XPU events
-    naive_begin_events = [torch.xpu.Event(enable_timing=True) for _ in range(iterations)]
-    naive_end_events = [torch.xpu.Event(enable_timing=True) for _ in range(iterations)]
-    ishmem_begin_events = [torch.xpu.Event(enable_timing=True) for _ in range(iterations)]
-    ishmem_end_events = [torch.xpu.Event(enable_timing=True) for _ in range(iterations)]
+    # Create XPU events (only if enabled)
+    if use_xpu_events:
+        naive_begin_events = [torch.xpu.Event(enable_timing=True) for _ in range(iterations)]
+        naive_end_events = [torch.xpu.Event(enable_timing=True) for _ in range(iterations)]
+        agrs_begin_events = [torch.xpu.Event(enable_timing=True) for _ in range(iterations)]
+        agrs_end_events = [torch.xpu.Event(enable_timing=True) for _ in range(iterations)]
+        ishmem_begin_events = [torch.xpu.Event(enable_timing=True) for _ in range(iterations)]
+        ishmem_end_events = [torch.xpu.Event(enable_timing=True) for _ in range(iterations)]
+    else:
+        naive_begin_events = naive_end_events = None
+        agrs_begin_events = agrs_end_events = None
+        ishmem_begin_events = ishmem_end_events = None
     
     results = {
         "num_tokens": num_tokens,
@@ -203,29 +262,84 @@ def run_single_benchmark(num_tokens, hidden_dim, num_experts, device, group_name
         
         start_time = time.perf_counter()
         for i in range(iterations):
-            naive_begin_events[i].record()
+            if use_xpu_events:
+                naive_begin_events[i].record()
             gathered = dispatcher_naive.dispatch(input_tensor, sizes)
             output_naive = dispatcher_naive.combine(gathered, sizes)
-            naive_end_events[i].record()
+            if use_xpu_events:
+                naive_end_events[i].record()
         
         torch.xpu.synchronize()
         dist.barrier()
         end_time = time.perf_counter()
         
         naive_e2e = (end_time - start_time) / iterations * 1000
-        naive_xpu_times = [naive_begin_events[i].elapsed_time(naive_end_events[i]) for i in range(iterations)]
-        naive_xpu_avg = sum(naive_xpu_times) / len(naive_xpu_times)
-        naive_xpu_min = min(naive_xpu_times)
-        naive_xpu_max = max(naive_xpu_times)
-        
         results["naive_e2e_ms"] = naive_e2e
-        results["naive_xpu_avg_ms"] = naive_xpu_avg
-        results["naive_xpu_min_ms"] = naive_xpu_min
-        results["naive_xpu_max_ms"] = naive_xpu_max
+        
+        if use_xpu_events:
+            naive_xpu_times = [naive_begin_events[i].elapsed_time(naive_end_events[i]) for i in range(iterations)]
+            naive_xpu_avg = sum(naive_xpu_times) / len(naive_xpu_times)
+            naive_xpu_min = min(naive_xpu_times)
+            naive_xpu_max = max(naive_xpu_times)
+            results["naive_xpu_avg_ms"] = naive_xpu_avg
+            results["naive_xpu_min_ms"] = naive_xpu_min
+            results["naive_xpu_max_ms"] = naive_xpu_max
+        else:
+            results["naive_xpu_avg_ms"] = naive_e2e  # Use E2E as fallback
+            results["naive_xpu_min_ms"] = float('nan')
+            results["naive_xpu_max_ms"] = float('nan')
     except Exception as e:
         results["naive_error"] = str(e)
         results["naive_e2e_ms"] = float('inf')
         results["naive_xpu_avg_ms"] = float('inf')
+    
+    dist.barrier()
+    
+    # =====================================================
+    # Benchmark AgRsAll2AllManager (AllGather + ReduceScatter)
+    # =====================================================
+    dispatcher_agrs = AgRsAll2AllManager(group=dist.group.WORLD)
+    
+    try:
+        for _ in range(warmup):
+            gathered = dispatcher_agrs.dispatch(input_tensor, sizes)
+            output = dispatcher_agrs.combine(gathered, sizes)
+        
+        torch.xpu.synchronize()
+        dist.barrier()
+        
+        start_time = time.perf_counter()
+        for i in range(iterations):
+            if use_xpu_events:
+                agrs_begin_events[i].record()
+            gathered = dispatcher_agrs.dispatch(input_tensor, sizes)
+            output_agrs = dispatcher_agrs.combine(gathered, sizes)
+            if use_xpu_events:
+                agrs_end_events[i].record()
+        
+        torch.xpu.synchronize()
+        dist.barrier()
+        end_time = time.perf_counter()
+        
+        agrs_e2e = (end_time - start_time) / iterations * 1000
+        results["agrs_e2e_ms"] = agrs_e2e
+        
+        if use_xpu_events:
+            agrs_xpu_times = [agrs_begin_events[i].elapsed_time(agrs_end_events[i]) for i in range(iterations)]
+            agrs_xpu_avg = sum(agrs_xpu_times) / len(agrs_xpu_times)
+            agrs_xpu_min = min(agrs_xpu_times)
+            agrs_xpu_max = max(agrs_xpu_times)
+            results["agrs_xpu_avg_ms"] = agrs_xpu_avg
+            results["agrs_xpu_min_ms"] = agrs_xpu_min
+            results["agrs_xpu_max_ms"] = agrs_xpu_max
+        else:
+            results["agrs_xpu_avg_ms"] = agrs_e2e  # Use E2E as fallback
+            results["agrs_xpu_min_ms"] = float('nan')
+            results["agrs_xpu_max_ms"] = float('nan')
+    except Exception as e:
+        results["agrs_error"] = str(e)
+        results["agrs_e2e_ms"] = float('inf')
+        results["agrs_xpu_avg_ms"] = float('inf')
     
     dist.barrier()
     
@@ -251,25 +365,32 @@ def run_single_benchmark(num_tokens, hidden_dim, num_experts, device, group_name
         
         start_time = time.perf_counter()
         for i in range(iterations):
-            ishmem_begin_events[i].record()
+            if use_xpu_events:
+                ishmem_begin_events[i].record()
             gathered = dispatcher_ishmem.dispatch(input_tensor, splits)
             output_ishmem = dispatcher_ishmem.combine()
-            ishmem_end_events[i].record()
+            if use_xpu_events:
+                ishmem_end_events[i].record()
         
         torch.xpu.synchronize()
         dist.barrier()
         end_time = time.perf_counter()
         
         ishmem_e2e = (end_time - start_time) / iterations * 1000
-        ishmem_xpu_times = [ishmem_begin_events[i].elapsed_time(ishmem_end_events[i]) for i in range(iterations)]
-        ishmem_xpu_avg = sum(ishmem_xpu_times) / len(ishmem_xpu_times)
-        ishmem_xpu_min = min(ishmem_xpu_times)
-        ishmem_xpu_max = max(ishmem_xpu_times)
-        
         results["ishmem_e2e_ms"] = ishmem_e2e
-        results["ishmem_xpu_avg_ms"] = ishmem_xpu_avg
-        results["ishmem_xpu_min_ms"] = ishmem_xpu_min
-        results["ishmem_xpu_max_ms"] = ishmem_xpu_max
+        
+        if use_xpu_events:
+            ishmem_xpu_times = [ishmem_begin_events[i].elapsed_time(ishmem_end_events[i]) for i in range(iterations)]
+            ishmem_xpu_avg = sum(ishmem_xpu_times) / len(ishmem_xpu_times)
+            ishmem_xpu_min = min(ishmem_xpu_times)
+            ishmem_xpu_max = max(ishmem_xpu_times)
+            results["ishmem_xpu_avg_ms"] = ishmem_xpu_avg
+            results["ishmem_xpu_min_ms"] = ishmem_xpu_min
+            results["ishmem_xpu_max_ms"] = ishmem_xpu_max
+        else:
+            results["ishmem_xpu_avg_ms"] = ishmem_e2e  # Use E2E as fallback
+            results["ishmem_xpu_min_ms"] = float('nan')
+            results["ishmem_xpu_max_ms"] = float('nan')
     except Exception as e:
         results["ishmem_error"] = str(e)
         results["ishmem_e2e_ms"] = float('inf')
@@ -277,14 +398,24 @@ def run_single_benchmark(num_tokens, hidden_dim, num_experts, device, group_name
     
     dist.barrier()
     
-    # Calculate speedups
-    if results.get("naive_xpu_avg_ms", float('inf')) < float('inf') and \
-       results.get("ishmem_xpu_avg_ms", float('inf')) < float('inf'):
-        results["e2e_speedup"] = results["naive_e2e_ms"] / results["ishmem_e2e_ms"]
-        results["xpu_speedup"] = results["naive_xpu_avg_ms"] / results["ishmem_xpu_avg_ms"]
+    # Calculate speedups (vs ISHMEM as baseline)
+    ishmem_avg = results.get("ishmem_xpu_avg_ms", float('inf'))
+    naive_avg = results.get("naive_xpu_avg_ms", float('inf'))
+    agrs_avg = results.get("agrs_xpu_avg_ms", float('inf'))
+    
+    if ishmem_avg < float('inf') and naive_avg < float('inf'):
+        results["naive_vs_ishmem"] = naive_avg / ishmem_avg
     else:
-        results["e2e_speedup"] = float('nan')
-        results["xpu_speedup"] = float('nan')
+        results["naive_vs_ishmem"] = float('nan')
+    
+    if ishmem_avg < float('inf') and agrs_avg < float('inf'):
+        results["agrs_vs_ishmem"] = agrs_avg / ishmem_avg
+    else:
+        results["agrs_vs_ishmem"] = float('nan')
+    
+    # Legacy speedup for backwards compatibility
+    results["e2e_speedup"] = results.get("naive_vs_ishmem", float('nan'))
+    results["xpu_speedup"] = results.get("naive_vs_ishmem", float('nan'))
     
     return results
 
@@ -297,51 +428,37 @@ def generate_markdown_table(all_results):
     lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     lines.append("")
     
-    # Main comparison table
-    lines.append("### Performance Comparison (XPU avg time)")
+    # Main comparison table with all three methods
+    lines.append("### Performance Comparison (E2E time in ms)")
     lines.append("")
-    lines.append("| num_tokens | hidden_dim | num_experts | Naive (ms) | ISHMEM (ms) | Speedup |")
-    lines.append("|------------|------------|-------------|------------|-------------|---------|")
+    lines.append("| num_tokens | hidden_dim | Naive | AgRs | ISHMEM | Naive/ISHMEM | AgRs/ISHMEM |")
+    lines.append("|------------|------------|-------|------|--------|--------------|-------------|")
     
     for r in all_results:
         naive = r.get("naive_xpu_avg_ms", float('inf'))
+        agrs = r.get("agrs_xpu_avg_ms", float('inf'))
         ishmem = r.get("ishmem_xpu_avg_ms", float('inf'))
-        speedup = r.get("xpu_speedup", float('nan'))
+        naive_vs_ishmem = r.get("naive_vs_ishmem", float('nan'))
+        agrs_vs_ishmem = r.get("agrs_vs_ishmem", float('nan'))
         
         naive_str = f"{naive:.3f}" if naive < float('inf') else "FAIL"
+        agrs_str = f"{agrs:.3f}" if agrs < float('inf') else "FAIL"
         ishmem_str = f"{ishmem:.3f}" if ishmem < float('inf') else "FAIL"
-        speedup_str = f"{speedup:.2f}x" if not (speedup != speedup) else "N/A"  # nan check
+        naive_ratio = f"{naive_vs_ishmem:.2f}x" if not (naive_vs_ishmem != naive_vs_ishmem) else "N/A"
+        agrs_ratio = f"{agrs_vs_ishmem:.2f}x" if not (agrs_vs_ishmem != agrs_vs_ishmem) else "N/A"
         
-        lines.append(f"| {r['num_tokens']:>10} | {r['hidden_dim']:>10} | {r['num_experts']:>11} | {naive_str:>10} | {ishmem_str:>11} | {speedup_str:>7} |")
+        lines.append(f"| {r['num_tokens']:>10} | {r['hidden_dim']:>10} | {naive_str:>5} | {agrs_str:>4} | {ishmem_str:>6} | {naive_ratio:>12} | {agrs_ratio:>11} |")
     
     lines.append("")
     
-    # Detailed table
-    lines.append("### Detailed Results")
+    # Legend
+    lines.append("**Legend:**")
+    lines.append("- **Naive**: Broadcast (dispatch) + AllReduce (combine)")
+    lines.append("- **AgRs**: AllGather (dispatch) + ReduceScatter (combine)")
+    lines.append("- **ISHMEM**: all_to_all_vdev_2d (symmetric memory)")
+    lines.append("- **Ratio**: Higher = ISHMEM is faster by that factor")
     lines.append("")
-    lines.append("| Config | Naive E2E | Naive XPU (avg/min/max) | ISHMEM E2E | ISHMEM XPU (avg/min/max) |")
-    lines.append("|--------|-----------|-------------------------|------------|--------------------------|")
     
-    for r in all_results:
-        config = f"{r['num_tokens']}x{r['hidden_dim']}x{r['num_experts']}"
-        
-        if r.get("naive_xpu_avg_ms", float('inf')) < float('inf'):
-            naive_e2e = f"{r['naive_e2e_ms']:.3f}"
-            naive_xpu = f"{r['naive_xpu_avg_ms']:.3f}/{r['naive_xpu_min_ms']:.3f}/{r['naive_xpu_max_ms']:.3f}"
-        else:
-            naive_e2e = "FAIL"
-            naive_xpu = "FAIL"
-        
-        if r.get("ishmem_xpu_avg_ms", float('inf')) < float('inf'):
-            ishmem_e2e = f"{r['ishmem_e2e_ms']:.3f}"
-            ishmem_xpu = f"{r['ishmem_xpu_avg_ms']:.3f}/{r['ishmem_xpu_min_ms']:.3f}/{r['ishmem_xpu_max_ms']:.3f}"
-        else:
-            ishmem_e2e = "FAIL"
-            ishmem_xpu = "FAIL"
-        
-        lines.append(f"| {config} | {naive_e2e} | {naive_xpu} | {ishmem_e2e} | {ishmem_xpu} |")
-    
-    lines.append("")
     return "\n".join(lines)
 
 
@@ -350,9 +467,10 @@ def generate_csv(all_results):
     lines = []
     headers = [
         "num_tokens", "hidden_dim", "num_experts", "local_tokens", "world_size",
-        "naive_e2e_ms", "naive_xpu_avg_ms", "naive_xpu_min_ms", "naive_xpu_max_ms",
-        "ishmem_e2e_ms", "ishmem_xpu_avg_ms", "ishmem_xpu_min_ms", "ishmem_xpu_max_ms",
-        "e2e_speedup", "xpu_speedup"
+        "naive_e2e_ms", "naive_xpu_avg_ms",
+        "agrs_e2e_ms", "agrs_xpu_avg_ms",
+        "ishmem_e2e_ms", "ishmem_xpu_avg_ms",
+        "naive_vs_ishmem", "agrs_vs_ishmem"
     ]
     lines.append(",".join(headers))
     
@@ -380,7 +498,11 @@ def main():
     parser.add_argument("--preset", type=str, default="medium", 
                         choices=["small", "medium", "large", "full"],
                         help="Preset configuration set")
+    parser.add_argument("--no-xpu-events", action="store_true",
+                        help="Disable XPU event timing (use this if hanging with many ranks)")
     args = parser.parse_args()
+    
+    use_xpu_events = not args.no_xpu_events
     
     # Define benchmark configurations
     if args.preset == "small":
@@ -426,12 +548,13 @@ def main():
     symm_mem.enable_symm_mem_for_group(group_name)
     
     if rank == 0:
-        print(f"\n{'='*70}")
-        print(f"ISHMEM vs NaiveAll2All Benchmark Matrix")
-        print(f"World size: {world_size}")
-        print(f"Preset: {args.preset} ({len(configs)} configurations)")
-        print(f"Warmup: {args.warmup}, Iterations: {args.iterations}")
-        print(f"{'='*70}\n")
+        print(f"\n{'='*70}", flush=True)
+        print(f"ISHMEM vs NaiveAll2All Benchmark Matrix", flush=True)
+        print(f"World size: {world_size}", flush=True)
+        print(f"Preset: {args.preset} ({len(configs)} configurations)", flush=True)
+        print(f"Warmup: {args.warmup}, Iterations: {args.iterations}", flush=True)
+        print(f"XPU Events: {'enabled' if use_xpu_events else 'disabled'}", flush=True)
+        print(f"{'='*70}\n", flush=True)
     
     all_results = []
     
@@ -449,19 +572,20 @@ def main():
                 device=device,
                 group_name=group_name,
                 warmup=args.warmup,
-                iterations=args.iterations
+                iterations=args.iterations,
+                use_xpu_events=use_xpu_events
             )
             all_results.append(results)
             
             if rank == 0:
                 speedup = results.get("xpu_speedup", float('nan'))
                 if speedup == speedup:  # not nan
-                    print(f"Done! Speedup: {speedup:.2f}x")
+                    print(f"Done! Speedup: {speedup:.2f}x", flush=True)
                 else:
-                    print("Done! (speedup N/A)")
+                    print("Done! (speedup N/A)", flush=True)
         except Exception as e:
             if rank == 0:
-                print(f"FAILED: {e}")
+                print(f"FAILED: {e}", flush=True)
             all_results.append({
                 **config,
                 "error": str(e),
@@ -472,33 +596,33 @@ def main():
     
     # Generate and save results
     if rank == 0:
-        print(f"\n{'='*70}")
-        print("Generating results...")
+        print(f"\n{'='*70}", flush=True)
+        print("Generating results...", flush=True)
         
         # Generate Markdown
         md_content = generate_markdown_table(all_results)
         md_file = os.path.join(args.output_dir, f"benchmark_results_n{world_size}.md")
         with open(md_file, "w") as f:
             f.write(md_content)
-        print(f"Markdown saved: {md_file}")
+        print(f"Markdown saved: {md_file}", flush=True)
         
         # Generate CSV
         csv_content = generate_csv(all_results)
         csv_file = os.path.join(args.output_dir, f"benchmark_results_n{world_size}.csv")
         with open(csv_file, "w") as f:
             f.write(csv_content)
-        print(f"CSV saved: {csv_file}")
+        print(f"CSV saved: {csv_file}", flush=True)
         
         # Generate JSON
         json_file = os.path.join(args.output_dir, f"benchmark_results_n{world_size}.json")
         with open(json_file, "w") as f:
             json.dump(all_results, f, indent=2)
-        print(f"JSON saved: {json_file}")
+        print(f"JSON saved: {json_file}", flush=True)
         
         # Print summary table
-        print("\n" + md_content)
+        print("\n" + md_content, flush=True)
         
-        print(f"{'='*70}\n")
+        print(f"{'='*70}\n", flush=True)
     
     dist.barrier()
     dist.destroy_process_group()
