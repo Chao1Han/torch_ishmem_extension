@@ -9,21 +9,21 @@ namespace c10d::ishmem_extension {
 // ==================== ExchangeSplitsKernel Implementation ====================
 
 void ExchangeSplitsKernel::operator()(sycl::nd_item<1> item) const {
-  int my_pe = ishmem_team_my_pe(team);
-  int n_pes = ishmem_team_n_pes(team);
   int tid = item.get_global_linear_id();
   auto grp = item.get_group();
 
+  // out_splits_offsets is a 2D tensor with shape (2, world_size) in row-major layout
+  // Row 0: output_splits, Row 1: source_offsets
   int64_t* input_splits = in_splits;
   int64_t* output_splits = out_splits_offsets;
-  int64_t* source_offsets = out_splits_offsets + n_pes;
+  int64_t* source_offsets = out_splits_offsets + world_size;
 
   // Shared memory for prefix sum results
   auto shared_ptr =
       shared_offsets.get_multi_ptr<sycl::access::decorated::no>().get();
 
   // Calculate source offsets (prefix sum of input_splits)
-  if (tid < n_pes) {
+  if (tid < world_size) {
     shared_ptr[tid] = (tid == 0) ? 0 : input_splits[tid - 1];
   }
   sycl::group_barrier(grp);
@@ -31,7 +31,7 @@ void ExchangeSplitsKernel::operator()(sycl::nd_item<1> item) const {
   // Simple prefix sum for source offsets
   if (tid == 0) {
     int64_t sum = 0;
-    for (int i = 0; i < n_pes; ++i) {
+    for (int i = 0; i < world_size; ++i) {
       int64_t val = shared_ptr[i];
       shared_ptr[i] = sum;
       sum += val;
@@ -39,24 +39,52 @@ void ExchangeSplitsKernel::operator()(sycl::nd_item<1> item) const {
   }
   sycl::group_barrier(grp);
 
-  // Exchange splits with remote PEs using device-side RMA
-  if (tid < n_pes) {
-    int target_global = ishmem_team_translate_pe(team, tid, ISHMEM_TEAM_WORLD);
+  // Exchange splits with remote PEs using direct memory writes
+  if (tid < world_size) {
     // Get values from local/shared memory
     int64_t split_val = input_splits[tid];
     int64_t offset_val = shared_ptr[tid];
-    
-    // Send my split for this peer to target PE's output_splits[my_pe]
+
+    // Get remote buffer pointers for target rank
+    int64_t* remote_output_splits = (int64_t*)out_splits_ptrs[tid];
+    int64_t* remote_source_offsets = remote_output_splits + world_size;
+
+    // Send my split for this peer to target PE's output_splits[rank]
     // This tells target PE how much data I will send to it
-    // Use ishmem_int64_p (put scalar value) because source may be in shared memory
-    ishmem_int64_p(&output_splits[my_pe], split_val, target_global);
-    
-    // Send my source offset for this peer to target PE's source_offsets[my_pe]
+    remote_output_splits[rank] = split_val;
+
+    // Send my source offset for this peer to target PE's source_offsets[rank]
     // This tells target PE where to read data from my buffer
-    ishmem_int64_p(&source_offsets[my_pe], offset_val, target_global);
+    remote_source_offsets[rank] = offset_val;
   }
 
-  ishmemx_barrier_all_work_group(grp);
+  // Barrier using signal pads
+  sycl::group_barrier(grp);
+  if (grp.leader()) {
+    // Signal all other ranks that we're done
+    for (int i = 0; i < world_size; ++i) {
+      if (i != rank) {
+        sycl::atomic_ref<uint32_t, sycl::memory_order::seq_cst,
+                         sycl::memory_scope::system,
+                         sycl::access::address_space::global_space>
+            signal_ref(*((uint32_t*)signal_pad_ptrs[i]));
+        signal_ref.fetch_add(1);
+      }
+    }
+
+    // Wait for all other ranks
+    sycl::atomic_ref<uint32_t, sycl::memory_order::seq_cst,
+                     sycl::memory_scope::system,
+                     sycl::access::address_space::global_space>
+        local_signal(*((uint32_t*)signal_pad_ptrs[rank]));
+    uint32_t expected = world_size - 1;
+    while (local_signal.load() < expected) {
+      // Spin wait
+    }
+    // Reset signal for next use
+    local_signal.store(0);
+  }
+  sycl::group_barrier(grp);
 }
 
 void ExchangeSplitsKernel::sycl_ker_config_convention(sycl::handler& cgh) {
@@ -66,10 +94,16 @@ void ExchangeSplitsKernel::sycl_ker_config_convention(sycl::handler& cgh) {
 ExchangeSplitsKernel::ExchangeSplitsKernel(
     int64_t* in_splits_,
     int64_t* out_splits_offsets_,
-    ishmem_team_t team_)
+    void** out_splits_ptrs_,
+    void** signal_pad_ptrs_,
+    int rank_,
+    int world_size_)
     : in_splits(in_splits_),
       out_splits_offsets(out_splits_offsets_),
-      team(team_),
+      out_splits_ptrs(out_splits_ptrs_),
+      signal_pad_ptrs(signal_pad_ptrs_),
+      rank(rank_),
+      world_size(world_size_),
       shared_offsets() {}
 
 // ==================== AllToAllVKernel Implementation ====================
@@ -79,13 +113,15 @@ void AllToAllVKernel::operator()(sycl::nd_item<1> item) const {
   int group_id = item.get_group_linear_id();
   int num_groups = item.get_group_range(0);
 
-  int my_pe = ishmem_team_my_pe(team);
-  int n_pes = ishmem_team_n_pes(team);
-
+  // out_splits_offsets is a 2D tensor with shape (2, world_size) in row-major layout
+  // Row 0: output_splits, Row 1: source_offsets
   int64_t* output_splits = out_splits_offsets;
-  int64_t* source_offsets = out_splits_offsets + n_pes;
+  int64_t* source_offsets = out_splits_offsets + world_size;
 
-  int groups_per_peer = sycl::max(num_groups / n_pes, 1);
+  // Calculate groups per peer, ensuring at least 1 group per peer if possible
+  int groups_per_peer = sycl::max(num_groups / world_size, 1);
+  // If we have fewer groups than peers, some groups will handle multiple peers
+  int peers_per_group = (num_groups < world_size) ? ((world_size + num_groups - 1) / num_groups) : 1;
 
   // Shared memory for output offsets (prefix sum of output_splits)
   auto peer_ptr =
@@ -94,48 +130,93 @@ void AllToAllVKernel::operator()(sycl::nd_item<1> item) const {
   // Calculate output offsets (prefix sum)
   if (item.get_local_linear_id() == 0) {
     peer_ptr[0] = 0;
-    for (int i = 1; i < n_pes; ++i) {
+    for (int i = 1; i < world_size; ++i) {
       peer_ptr[i] = peer_ptr[i - 1] + output_splits[i - 1];
     }
   }
   sycl::group_barrier(grp);
 
   // Each work-group handles data transfer to one or more peers
-  for (int i = group_id / groups_per_peer; i < n_pes;
-       i += num_groups / groups_per_peer) {
-    int peer = (my_pe + i) % n_pes; // Round-robin to avoid hotspots
-    int peer_global = ishmem_team_translate_pe(team, peer, ISHMEM_TEAM_WORLD);
+  if (num_groups >= world_size) {
+    // Case 1: Multiple groups per peer (or 1:1)
+    for (int i = group_id / groups_per_peer; i < world_size;
+         i += num_groups / groups_per_peer) {
+      int peer = (rank + i) % world_size; // Round-robin to avoid hotspots
 
-    // Total bytes to receive from peer
-    size_t peer_size = output_splits[peer] * stride;
-    if (peer_size == 0)
-      continue;
+      // Total bytes to receive from peer
+      size_t peer_size = output_splits[peer] * stride;
+      if (peer_size == 0)
+        continue;
 
-    // Divide work among groups handling this peer
-    size_t block_size = peer_size / groups_per_peer;
-    size_t block_offset = block_size * (group_id % groups_per_peer);
-    size_t source_offset = source_offsets[peer] * stride + block_offset;
-    size_t write_offset = peer_ptr[peer] * stride + block_offset;
+      // Divide work among groups handling this peer
+      size_t block_size = peer_size / groups_per_peer;
+      size_t block_offset = block_size * (group_id % groups_per_peer);
+      size_t source_offset = source_offsets[peer] * stride + block_offset;
+      size_t write_offset = peer_ptr[peer] * stride + block_offset;
 
-    // Use ISHMEM work-group RMA to get data
-    ishmemx_getmem_nbi_work_group(
-        (char*)recv_data + write_offset,
-        (char*)send_data + source_offset,
-        block_size,
-        peer_global,
-        grp);
+      // Get data from remote peer using direct memory copy
+      char* remote_send_data = (char*)send_data_ptrs[peer];
+      for (size_t tid = item.get_local_linear_id(); tid < block_size; tid += item.get_local_range(0)) {
+        ((char*)recv_data)[write_offset + tid] = remote_send_data[source_offset + tid];
+      }
+    }
+  } else {
+    // Case 2: Multiple peers per group
+    for (int i = 0; i < peers_per_group; ++i) {
+      int peer_idx = group_id * peers_per_group + i;
+      if (peer_idx >= world_size)
+        break;
+
+      int peer = (rank + peer_idx) % world_size;
+
+      size_t peer_size = output_splits[peer] * stride;
+      if (peer_size == 0)
+        continue;
+
+      size_t source_offset = source_offsets[peer] * stride;
+      size_t write_offset = peer_ptr[peer] * stride;
+
+      // Single group handles entire peer
+      char* remote_send_data = (char*)send_data_ptrs[peer];
+      for (size_t tid = item.get_local_linear_id(); tid < peer_size; tid += item.get_local_range(0)) {
+        ((char*)recv_data)[write_offset + tid] = remote_send_data[source_offset + tid];
+      }
+    }
   }
 
   // Write output offsets back (for compatibility)
-  if (group_id == 0 && item.get_local_linear_id() < n_pes) {
+  if (group_id == 0 && item.get_local_linear_id() < world_size) {
     source_offsets[item.get_local_linear_id()] =
         peer_ptr[item.get_local_linear_id()];
   }
 
-  // Ensure all RMA operations complete
+  // Barrier using signal pads
+  sycl::group_barrier(grp);
   if (grp.leader()) {
-    ishmem_quiet();
+    // Signal all other ranks that we're done
+    for (int i = 0; i < world_size; ++i) {
+      if (i != rank) {
+        sycl::atomic_ref<uint32_t, sycl::memory_order::seq_cst,
+                         sycl::memory_scope::system,
+                         sycl::access::address_space::global_space>
+            signal_ref(*((uint32_t*)signal_pad_ptrs[i]));
+        signal_ref.fetch_add(1);
+      }
+    }
+
+    // Wait for all other ranks
+    sycl::atomic_ref<uint32_t, sycl::memory_order::seq_cst,
+                     sycl::memory_scope::system,
+                     sycl::access::address_space::global_space>
+        local_signal(*((uint32_t*)signal_pad_ptrs[rank]));
+    uint32_t expected = world_size - 1;
+    while (local_signal.load() < expected) {
+      // Spin wait
+    }
+    // Reset signal for next use
+    local_signal.store(0);
   }
+  sycl::group_barrier(grp);
 }
 
 void AllToAllVKernel::sycl_ker_config_convention(sycl::handler& cgh) {
@@ -147,12 +228,18 @@ AllToAllVKernel::AllToAllVKernel(
     void* recv_data_,
     int64_t* out_splits_offsets_,
     size_t stride_,
-    ishmem_team_t team_)
+    void** send_data_ptrs_,
+    void** signal_pad_ptrs_,
+    int rank_,
+    int world_size_)
     : send_data(send_data_),
       recv_data(recv_data_),
       out_splits_offsets(out_splits_offsets_),
       stride(stride_),
-      team(team_),
+      send_data_ptrs(send_data_ptrs_),
+      signal_pad_ptrs(signal_pad_ptrs_),
+      rank(rank_),
+      world_size(world_size_),
       peer_offsets() {}
 
 void all_to_all_vdev(
@@ -172,9 +259,6 @@ void all_to_all_vdev(
   int rank = input_hdl->get_rank();
   int world_size = input_hdl->get_world_size();
 
-  // Get ISHMEM team (for now use WORLD, can extend to support sub-teams)
-  ishmem_team_t team = ISHMEM_TEAM_WORLD;
-
   void* input_ptr = input.data_ptr();
   void* output_ptr = out.mutable_data_ptr();
   int64_t* in_splits_ptr = (int64_t*)(in_splits.const_data_ptr());
@@ -192,16 +276,21 @@ void all_to_all_vdev(
   TORCH_CHECK_EQ(out_splits_offsets.size(0), 2);
   TORCH_CHECK_EQ(out_splits_offsets.size(1), world_size);
 
+  // Get buffer pointers and signal pads from symmetric memory handles
+  void** out_splits_ptrs = (void**)out_splits_offsets_hdl->get_buffer_ptrs_dev();
+  void** input_ptrs = (void**)input_hdl->get_buffer_ptrs_dev();
+  void** signal_pad_ptrs = (void**)input_hdl->get_signal_pad_ptrs_dev();
+
   size_t stride = input.element_size();
   auto queue = at::xpu::getCurrentXPUStream(input.device().index());
 
   auto global_range_1 = WORK_GROUP_SIZE;
   auto local_range_1 = WORK_GROUP_SIZE;
-  auto kfn_1 =
-      ExchangeSplitsKernel(in_splits_ptr, out_splits_offsets_ptr, team);
+  auto kfn_1 = ExchangeSplitsKernel(
+      in_splits_ptr, out_splits_offsets_ptr, out_splits_ptrs, signal_pad_ptrs, rank, world_size);
 
   sycl_kernel_submit(global_range_1, local_range_1, queue, kfn_1);
-  
+
   // CRITICAL: Wait for ExchangeSplitsKernel to complete before starting AllToAllVKernel
   // The AllToAllVKernel needs the splits/offsets data from ExchangeSplitsKernel
   c10::xpu::syncStreamsOnDevice(input.device().index());
@@ -218,68 +307,24 @@ void all_to_all_vdev(
   auto global_range_2 = num_work_groups * WORK_GROUP_SIZE;
   auto local_range_2 = WORK_GROUP_SIZE;
   auto kfn_2 = AllToAllVKernel(
-      input_ptr, output_ptr, out_splits_offsets_ptr, stride, team);
+      input_ptr, output_ptr, out_splits_offsets_ptr, stride, input_ptrs, signal_pad_ptrs, rank, world_size);
 
   sycl_kernel_submit(global_range_2, local_range_2, queue, kfn_2);
 }
 
 // ==================== 2D AllToAllV Implementation (for MoE) ====================
 
-// Helper function: Simple prefix sum for a sub-group
-// Returns the sum of all elements
-template <int SIZE>
-SYCL_EXTERNAL int64_t prefix_sum_subgroup(
-    int64_t* odata,
-    int64_t* idata,
-    int n,
-    sycl::nd_item<1>& item,
-    int64_t* shared_tmp) {
-  static_assert(SIZE <= A2AV_TILE_SIZE, "SIZE must be <= A2AV_TILE_SIZE");
-  
-  int lane_id = item.get_local_linear_id() % A2AV_TILE_SIZE;
-  
-  // Load input
-  int64_t val = (lane_id < n) ? idata[lane_id] : 0;
-  
-  // Exclusive prefix sum using sequential algorithm in shared memory
-  if (lane_id < n) {
-    shared_tmp[lane_id] = val;
-  }
-  sycl::group_barrier(item.get_group());
-  
-  // First thread computes prefix sum
-  int64_t total_sum = 0;
-  if (lane_id == 0) {
-    int64_t sum = 0;
-    for (int i = 0; i < n; ++i) {
-      int64_t v = shared_tmp[i];
-      shared_tmp[i] = sum;
-      sum += v;
-    }
-    total_sum = sum;
-  }
-  sycl::group_barrier(item.get_group());
-  
-  // Write output
-  if (lane_id < n) {
-    odata[lane_id] = shared_tmp[lane_id];
-  }
-  
-  // Broadcast total sum
-  total_sum = sycl::group_broadcast(item.get_group(), shared_tmp[n-1] + idata[n-1], 0);
-  
-  return total_sum;
-}
-
 // ExchangeSplitsKernel2D Implementation
 template <bool HAS_IN_OFFSETS>
 void ExchangeSplitsKernel2D<HAS_IN_OFFSETS>::operator()(sycl::nd_item<1> item) const {
-  int my_pe = ishmem_team_my_pe(team);
-  int n_pes = ishmem_team_n_pes(team);
-  int nsplits = n_pes * ne;
+  int nsplits = world_size * ne;
   int tid = item.get_local_linear_id();
   auto grp = item.get_group();
 
+  // in_splits_offsets layout depends on HAS_IN_OFFSETS:
+  // If false: 1D tensor with shape (nsplits,) containing only splits
+  // If true: 2D tensor with shape (2, nsplits) where row 0 is splits, row 1 is offsets
+  // out_splits_offsets is always 2D with shape (2, nsplits) in row-major layout
   int64_t* input_splits = in_splits_offsets;
   int64_t* output_splits = out_splits_offsets;
   int64_t* source_offsets = out_splits_offsets + nsplits;
@@ -317,24 +362,52 @@ void ExchangeSplitsKernel2D<HAS_IN_OFFSETS>::operator()(sycl::nd_item<1> item) c
     if (rank_is_row_in) {
       peer = tid / ne;
       e = tid % ne;
-      dst_offset = e * n_pes + my_pe;
+      dst_offset = e * world_size + rank;
     } else {
-      peer = tid % n_pes;
-      e = tid / n_pes;
-      dst_offset = my_pe * ne + e;
+      peer = tid % world_size;
+      e = tid / world_size;
+      dst_offset = rank * ne + e;
     }
 
     int64_t split_val = input_splits[tid];
     int64_t offset_val = input_offsets[tid];
-    int peer_global = ishmem_team_translate_pe(team, peer, ISHMEM_TEAM_WORLD);
 
-    // Send offset and split to peer using ishmem_int64_p (put scalar value)
-    // This is needed because input_offsets may point to shared memory, not symmetric memory
-    ishmem_int64_p(&source_offsets[dst_offset], offset_val, peer_global);
-    ishmem_int64_p(&output_splits[dst_offset], split_val, peer_global);
+    // Get remote buffer pointers for target rank
+    int64_t* remote_output_splits = (int64_t*)out_splits_ptrs[peer];
+    int64_t* remote_source_offsets = remote_output_splits + nsplits;
+
+    // Send offset and split to peer using direct memory writes
+    remote_source_offsets[dst_offset] = offset_val;
+    remote_output_splits[dst_offset] = split_val;
   }
 
-  ishmemx_barrier_all_work_group(grp);
+  // Barrier using signal pads
+  sycl::group_barrier(grp);
+  if (grp.leader()) {
+    // Signal all other ranks that we're done
+    for (int i = 0; i < world_size; ++i) {
+      if (i != rank) {
+        sycl::atomic_ref<uint32_t, sycl::memory_order::seq_cst,
+                         sycl::memory_scope::system,
+                         sycl::access::address_space::global_space>
+            signal_ref(*((uint32_t*)signal_pad_ptrs[i]));
+        signal_ref.fetch_add(1);
+      }
+    }
+
+    // Wait for all other ranks
+    sycl::atomic_ref<uint32_t, sycl::memory_order::seq_cst,
+                     sycl::memory_scope::system,
+                     sycl::access::address_space::global_space>
+        local_signal(*((uint32_t*)signal_pad_ptrs[rank]));
+    uint32_t expected = world_size - 1;
+    while (local_signal.load() < expected) {
+      // Spin wait
+    }
+    // Reset signal for next use
+    local_signal.store(0);
+  }
+  sycl::group_barrier(grp);
 }
 
 template <bool HAS_IN_OFFSETS>
@@ -346,13 +419,19 @@ template <bool HAS_IN_OFFSETS>
 ExchangeSplitsKernel2D<HAS_IN_OFFSETS>::ExchangeSplitsKernel2D(
     int64_t* in_splits_offsets_,
     int64_t* out_splits_offsets_,
-    ishmem_team_t team_,
+    void** out_splits_ptrs_,
+    void** signal_pad_ptrs_,
+    int rank_,
+    int world_size_,
     int ne_,
     size_t input_dim0_,
     bool rank_is_row_in_)
     : in_splits_offsets(in_splits_offsets_),
       out_splits_offsets(out_splits_offsets_),
-      team(team_),
+      out_splits_ptrs(out_splits_ptrs_),
+      signal_pad_ptrs(signal_pad_ptrs_),
+      rank(rank_),
+      world_size(world_size_),
       ne(ne_),
       input_dim0(input_dim0_),
       rank_is_row_in(rank_is_row_in_),
@@ -370,6 +449,8 @@ void AllToAllVKernel2D::operator()(sycl::nd_item<1> item) const {
   int tid = item.get_local_linear_id();
 
   int nsplits = minor_size * major_size;
+  // out_splits_offsets is a 2D tensor with shape (2, nsplits) in row-major layout
+  // Row 0: output_splits, Row 1: source_offsets
   int64_t* output_splits = out_splits_offsets;
   int64_t* source_offsets = out_splits_offsets + nsplits;
 
@@ -395,7 +476,7 @@ void AllToAllVKernel2D::operator()(sycl::nd_item<1> item) const {
   // Compute prefix sum for each tile
   if (tile_id < major_size) {
     int64_t* row_data = tile_sums_ptr + tile_id * A2AV_TILE_SIZE;
-    
+
     // First lane of each tile computes prefix sum
     if (lane_id == 0) {
       int64_t sum = 0;
@@ -406,11 +487,11 @@ void AllToAllVKernel2D::operator()(sycl::nd_item<1> item) const {
         sum += val;
         total = sum;
       }
-      
-      // Apply major alignment
-      if (major_align != 0) {
+
+      // Apply major alignment (only if there's data to align)
+      if (major_align != 0 && total > 0) {
         int64_t aligned_len = (total + major_align - 1) / major_align * major_align;
-        len_ptr[tile_id] = (aligned_len == 0) ? major_align : aligned_len;
+        len_ptr[tile_id] = aligned_len;
       } else {
         len_ptr[tile_id] = total;
       }
@@ -435,8 +516,6 @@ void AllToAllVKernel2D::operator()(sycl::nd_item<1> item) const {
   sycl::group_barrier(grp);
 
   // Step 3: Perform data transfer
-  int n_pes = ishmem_team_n_pes(team);
-  
   for (int eid = group_id; eid < nsplits; eid += num_groups) {
     int row = eid / minor_size;
     int col = eid % minor_size;
@@ -449,14 +528,12 @@ void AllToAllVKernel2D::operator()(sycl::nd_item<1> item) const {
     int64_t write_offset = e_offset * stride;
 
     int peer_idx = rank_is_row_out ? row : col;
-    int peer_global = ishmem_team_translate_pe(team, peer_idx, ISHMEM_TEAM_WORLD);
 
-    ishmemx_getmem_nbi_work_group(
-        (char*)recv_data + write_offset,
-        (char*)send_data + src_offset,
-        peer_size,
-        peer_global,
-        grp);
+    // Get data from remote peer using direct memory copy
+    char* remote_send_data = (char*)send_data_ptrs[peer_idx];
+    for (size_t i = item.get_local_linear_id(); i < peer_size; i += item.get_local_range(0)) {
+      ((char*)recv_data)[write_offset + i] = remote_send_data[src_offset + i];
+    }
   }
 
   // Write output offsets back
@@ -466,10 +543,33 @@ void AllToAllVKernel2D::operator()(sycl::nd_item<1> item) const {
     source_offsets[tid] = tile_sums_ptr[row * A2AV_TILE_SIZE + col];
   }
 
-  // Ensure all RMA operations complete
+  // Barrier using signal pads
+  sycl::group_barrier(grp);
   if (grp.leader()) {
-    ishmem_quiet();
+    // Signal all other ranks that we're done
+    for (int i = 0; i < world_size; ++i) {
+      if (i != rank) {
+        sycl::atomic_ref<uint32_t, sycl::memory_order::seq_cst,
+                         sycl::memory_scope::system,
+                         sycl::access::address_space::global_space>
+            signal_ref(*((uint32_t*)signal_pad_ptrs[i]));
+        signal_ref.fetch_add(1);
+      }
+    }
+
+    // Wait for all other ranks
+    sycl::atomic_ref<uint32_t, sycl::memory_order::seq_cst,
+                     sycl::memory_scope::system,
+                     sycl::access::address_space::global_space>
+        local_signal(*((uint32_t*)signal_pad_ptrs[rank]));
+    uint32_t expected = world_size - 1;
+    while (local_signal.load() < expected) {
+      // Spin wait
+    }
+    // Reset signal for next use
+    local_signal.store(0);
   }
+  sycl::group_barrier(grp);
 }
 
 void AllToAllVKernel2D::sycl_ker_config_convention(sycl::handler& cgh) {
@@ -488,7 +588,10 @@ AllToAllVKernel2D::AllToAllVKernel2D(
     int major_size_,
     int64_t major_align_,
     bool rank_is_row_out_,
-    ishmem_team_t team_)
+    void** send_data_ptrs_,
+    void** signal_pad_ptrs_,
+    int rank_,
+    int world_size_)
     : send_data(send_data_),
       recv_data(recv_data_),
       in_splits(in_splits_),
@@ -498,7 +601,10 @@ AllToAllVKernel2D::AllToAllVKernel2D(
       major_size(major_size_),
       major_align(major_align_),
       rank_is_row_out(rank_is_row_out_),
-      team(team_),
+      send_data_ptrs(send_data_ptrs_),
+      signal_pad_ptrs(signal_pad_ptrs_),
+      rank(rank_),
+      world_size(world_size_),
       tile_prefix_sums(),
       len_per_tile(),
       start_offset_per_tile() {}
@@ -561,9 +667,15 @@ void all_to_all_vdev_2d(
       "splits and offsets must be int64");
 
   int ne = in_split_shape[0] / world_size;
-  TORCH_CHECK(ne <= NUM_TILES, "Number of experts must be smaller than NUM_TILES (", NUM_TILES, ")");
+  // Each expert needs one tile in the 2D kernel, and we have NUM_TILES available
+  TORCH_CHECK(ne <= NUM_TILES, "Number of experts (", ne,
+      ") must be <= NUM_TILES (", NUM_TILES, ")");
 
-  ishmem_team_t team = ISHMEM_TEAM_WORLD;
+  // Get buffer pointers and signal pads from symmetric memory handles
+  void** out_splits_ptrs = (void**)out_splits_offsets_hdl->get_buffer_ptrs_dev();
+  void** input_ptrs = (void**)input_hdl->get_buffer_ptrs_dev();
+  void** signal_pad_ptrs = (void**)input_hdl->get_signal_pad_ptrs_dev();
+
   auto queue = at::xpu::getCurrentXPUStream(input.device().index());
 
   // Kernel 1: Exchange splits and offsets
@@ -573,7 +685,8 @@ void all_to_all_vdev_2d(
   auto global_range_1 = WORK_GROUP_SIZE;
   auto local_range_1 = WORK_GROUP_SIZE;
   auto kfn_1 = ExchangeSplitsKernel2D<false>(
-      in_splits_ptr, out_splits_offsets_ptr, team, ne, input_dim0, rank_is_row_in);
+      in_splits_ptr, out_splits_offsets_ptr, out_splits_ptrs, signal_pad_ptrs,
+      rank, world_size, ne, input_dim0, rank_is_row_in);
 
   sycl_kernel_submit(global_range_1, local_range_1, queue, kfn_1);
 
@@ -590,7 +703,8 @@ void all_to_all_vdev_2d(
   auto local_range_2 = WORK_GROUP_SIZE;
   auto kfn_2 = AllToAllVKernel2D(
       input_ptr, output_ptr, in_splits_ptr, out_splits_offsets_ptr,
-      stride_bytes, world_size, ne, major_align_val, rank_is_row_out, team);
+      stride_bytes, world_size, ne, major_align_val, rank_is_row_out,
+      input_ptrs, signal_pad_ptrs, rank, world_size);
 
   sycl_kernel_submit(global_range_2, local_range_2, queue, kfn_2);
 }
@@ -648,9 +762,16 @@ void all_to_all_vdev_2d_offset(
       "splits and offsets must be int64");
 
   int ne = in_split_shape[1] / world_size;
-  TORCH_CHECK(ne <= A2AV_TILE_SIZE, "Number of experts must be smaller than A2AV_TILE_SIZE (", A2AV_TILE_SIZE, ")");
+  // For combine operation, experts are in minor dimension, limited by A2AV_TILE_SIZE
+  // But we also need tiles for major dimension, so use NUM_TILES as the limit
+  TORCH_CHECK(ne <= NUM_TILES, "Number of experts (", ne,
+      ") must be <= NUM_TILES (", NUM_TILES, ")");
 
-  ishmem_team_t team = ISHMEM_TEAM_WORLD;
+  // Get buffer pointers and signal pads from symmetric memory handles
+  void** out_splits_ptrs = (void**)out_splits_offsets_hdl->get_buffer_ptrs_dev();
+  void** input_ptrs = (void**)input_hdl->get_buffer_ptrs_dev();
+  void** signal_pad_ptrs = (void**)input_hdl->get_signal_pad_ptrs_dev();
+
   auto queue = at::xpu::getCurrentXPUStream(input.device().index());
 
   // Kernel 1: Exchange splits and offsets (with input offsets provided)
@@ -660,7 +781,8 @@ void all_to_all_vdev_2d_offset(
   auto global_range_1 = WORK_GROUP_SIZE;
   auto local_range_1 = WORK_GROUP_SIZE;
   auto kfn_1 = ExchangeSplitsKernel2D<true>(
-      in_splits_offsets_ptr, out_splits_offsets_ptr, team, ne, input_dim0, rank_is_row_in);
+      in_splits_offsets_ptr, out_splits_offsets_ptr, out_splits_ptrs, signal_pad_ptrs,
+      rank, world_size, ne, input_dim0, rank_is_row_in);
 
   sycl_kernel_submit(global_range_1, local_range_1, queue, kfn_1);
 
@@ -677,7 +799,8 @@ void all_to_all_vdev_2d_offset(
   auto local_range_2 = WORK_GROUP_SIZE;
   auto kfn_2 = AllToAllVKernel2D(
       input_ptr, output_ptr, in_splits_offsets_ptr, out_splits_offsets_ptr,
-      stride_bytes, ne, world_size, major_align_val, rank_is_row_out, team);
+      stride_bytes, ne, world_size, major_align_val, rank_is_row_out,
+      input_ptrs, signal_pad_ptrs, rank, world_size);
 
   sycl_kernel_submit(global_range_2, local_range_2, queue, kfn_2);
 }

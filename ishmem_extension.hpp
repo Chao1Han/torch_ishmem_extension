@@ -4,19 +4,9 @@
 #include <c10/macros/Macros.h>
 #include <sycl/sycl.hpp>
 #include "SYCLHelpers.h"
-#include <ishmem.h>
-#include <ishmemx.h>
+#include <torch/csrc/distributed/c10d/symm_mem/SymmetricMemory.hpp>
 
 using namespace xpu;
-
-#define ISHMEM_CHECK(stmt, msg)                                              \
-  do {                                                                       \
-    int result = (stmt);                                                     \
-    TORCH_CHECK(                                                             \
-        result == 0,                                                         \
-        std::string(__FILE__) + ":" + std::to_string(__LINE__) + " " + msg + \
-            ". Error code: " + std::to_string(result));                      \
-  } while (0)
 
 namespace c10d::ishmem_extension {
 
@@ -31,12 +21,18 @@ struct ExchangeSplitsKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   ExchangeSplitsKernel(
       int64_t* in_splits_,
       int64_t* out_splits_offsets_,
-      ishmem_team_t team_);
+      void** out_splits_ptrs_,
+      void** signal_pad_ptrs_,
+      int rank_,
+      int world_size_);
 
  private:
   int64_t* in_splits; // input splits
   int64_t* out_splits_offsets; // [output_splits | output_offsets]
-  ishmem_team_t team;
+  void** out_splits_ptrs; // remote buffer pointers for all ranks
+  void** signal_pad_ptrs; // signal pad pointers for all ranks
+  int rank;
+  int world_size;
   sycl_local_acc_t<int64_t, 1> shared_offsets;
 };
 
@@ -50,14 +46,20 @@ struct AllToAllVKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
       void* recv_data_,
       int64_t* out_splits_offsets_,
       size_t stride_,
-      ishmem_team_t team_);
+      void** send_data_ptrs_,
+      void** signal_pad_ptrs_,
+      int rank_,
+      int world_size_);
 
  private:
   void* send_data;
   void* recv_data;
   int64_t* out_splits_offsets; // [output_splits | output_offsets]
   size_t stride; // Element size in bytes
-  ishmem_team_t team;
+  void** send_data_ptrs; // remote send buffer pointers for all ranks
+  void** signal_pad_ptrs; // signal pad pointers for all ranks
+  int rank;
+  int world_size;
   sycl_local_acc_t<int64_t, 1> peer_offsets;
 };
 
@@ -85,7 +87,10 @@ struct ExchangeSplitsKernel2D : public __SYCL_KER_CONFIG_CONVENTION__ {
   ExchangeSplitsKernel2D(
       int64_t* in_splits_offsets_,
       int64_t* out_splits_offsets_,
-      ishmem_team_t team_,
+      void** out_splits_ptrs_,
+      void** signal_pad_ptrs_,
+      int rank_,
+      int world_size_,
       int ne_,
       size_t input_dim0_,
       bool rank_is_row_in_);
@@ -93,7 +98,10 @@ struct ExchangeSplitsKernel2D : public __SYCL_KER_CONFIG_CONVENTION__ {
  private:
   int64_t* in_splits_offsets;   // input splits (and optionally offsets)
   int64_t* out_splits_offsets;  // [output_splits | source_offsets]
-  ishmem_team_t team;
+  void** out_splits_ptrs;       // remote buffer pointers for all ranks
+  void** signal_pad_ptrs;       // signal pad pointers for all ranks
+  int rank;
+  int world_size;
   int ne;                       // number of experts per rank
   size_t input_dim0;            // size of dim 0 of input tensor
   bool rank_is_row_in;          // true: rank-major input, false: expert-major input
@@ -115,7 +123,10 @@ struct AllToAllVKernel2D : public __SYCL_KER_CONFIG_CONVENTION__ {
       int major_size_,
       int64_t major_align_,
       bool rank_is_row_out_,
-      ishmem_team_t team_);
+      void** send_data_ptrs_,
+      void** signal_pad_ptrs_,
+      int rank_,
+      int world_size_);
 
  private:
   void* send_data;
@@ -127,7 +138,10 @@ struct AllToAllVKernel2D : public __SYCL_KER_CONFIG_CONVENTION__ {
   int major_size;               // ne for dispatch, npes for combine
   int64_t major_align;          // alignment for major dimension
   bool rank_is_row_out;         // output layout
-  ishmem_team_t team;
+  void** send_data_ptrs;        // remote send buffer pointers for all ranks
+  void** signal_pad_ptrs;       // signal pad pointers for all ranks
+  int rank;
+  int world_size;
   sycl_local_acc_t<int64_t, 1> tile_prefix_sums;  // [NUM_TILES][A2AV_TILE_SIZE]
   sycl_local_acc_t<int64_t, 1> len_per_tile;       // [NUM_TILES]
   sycl_local_acc_t<int64_t, 1> start_offset_per_tile;  // [NUM_TILES]

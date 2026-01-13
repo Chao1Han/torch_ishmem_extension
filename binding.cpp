@@ -59,50 +59,48 @@ TORCH_LIBRARY_IMPL(ishmem_ext, XPU, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.doc() = "Intel SHMEM Extension for PyTorch XPU";
-  
+  m.doc() = "PyTorch Symmetric Memory Extension for XPU";
+
   m.def(
       "all_to_all_vdev",
       &all_to_all_vdev_binding,
-      "ISHMEM-based all-to-all-v operation on XPU device",
+      "Symmetric Memory-based all-to-all-v operation on XPU device",
       py::arg("input"),
       py::arg("out"),
       py::arg("in_splits"),
       py::arg("out_splits_offsets"),
       py::arg("group_name"));
-  
+
   m.def(
       "all_to_all_vdev_2d",
       &all_to_all_vdev_2d_binding,
-      "ISHMEM-based 2D all-to-all-v operation for MoE dispatch (rank-major to expert-major)",
+      "Symmetric Memory-based 2D all-to-all-v operation for MoE dispatch (rank-major to expert-major)",
       py::arg("input"),
       py::arg("out"),
       py::arg("in_splits"),
       py::arg("out_splits_offsets"),
       py::arg("group_name"),
       py::arg("major_align") = py::none());
-  
+
   m.def(
       "all_to_all_vdev_2d_offset",
       &all_to_all_vdev_2d_offset_binding,
-      "ISHMEM-based 2D all-to-all-v operation for MoE combine (expert-major to rank-major)",
+      "Symmetric Memory-based 2D all-to-all-v operation for MoE combine (expert-major to rank-major)",
       py::arg("input"),
       py::arg("out"),
       py::arg("in_splits_offsets"),
       py::arg("out_splits_offsets"),
       py::arg("group_name"));
-  
+
   m.def("initialize", []() {
-    // Initialize ISHMEM if needed
+    // No-op: Symmetric memory is initialized via PyTorch's rendezvous
     static bool initialized = false;
     if (!initialized) {
-      // ISHMEM initialization is usually done by the runtime
       initialized = true;
     }
-  }, "Initialize ISHMEM runtime (if not already initialized)");
-  
+  }, "Initialize symmetric memory (no-op, handled by PyTorch)");
+
   m.def("finalize", []() {
-    // Finalize ISHMEM if needed
-    // Usually handled by runtime cleanup
-  }, "Finalize ISHMEM runtime");
+    // No-op: Symmetric memory cleanup is handled by PyTorch
+  }, "Finalize symmetric memory (no-op, handled by PyTorch)");
 }
