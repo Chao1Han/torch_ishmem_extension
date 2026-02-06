@@ -226,19 +226,6 @@ def run_single_benchmark(num_tokens, hidden_dim, num_experts, device, group_name
     input_tensor = torch.randn(local_tokens, hidden_dim, dtype=dtype, device=device)
     sizes = [local_tokens] * world_size
     
-    # Create XPU events (only if enabled)
-    if use_xpu_events:
-        naive_begin_events = [torch.xpu.Event(enable_timing=True) for _ in range(iterations)]
-        naive_end_events = [torch.xpu.Event(enable_timing=True) for _ in range(iterations)]
-        agrs_begin_events = [torch.xpu.Event(enable_timing=True) for _ in range(iterations)]
-        agrs_end_events = [torch.xpu.Event(enable_timing=True) for _ in range(iterations)]
-        ishmem_begin_events = [torch.xpu.Event(enable_timing=True) for _ in range(iterations)]
-        ishmem_end_events = [torch.xpu.Event(enable_timing=True) for _ in range(iterations)]
-    else:
-        naive_begin_events = naive_end_events = None
-        agrs_begin_events = agrs_end_events = None
-        ishmem_begin_events = ishmem_end_events = None
-    
     results = {
         "num_tokens": num_tokens,
         "hidden_dim": hidden_dim,
@@ -252,6 +239,13 @@ def run_single_benchmark(num_tokens, hidden_dim, num_experts, device, group_name
     # =====================================================
     dispatcher_naive = NaiveAll2AllManager(group=dist.group.WORLD)
     
+    # Create separate events for dispatch and combine
+    if use_xpu_events:
+        naive_dispatch_begin = [torch.xpu.Event(enable_timing=True) for _ in range(iterations)]
+        naive_dispatch_end = [torch.xpu.Event(enable_timing=True) for _ in range(iterations)]
+        naive_combine_begin = [torch.xpu.Event(enable_timing=True) for _ in range(iterations)]
+        naive_combine_end = [torch.xpu.Event(enable_timing=True) for _ in range(iterations)]
+    
     try:
         for _ in range(warmup):
             gathered = dispatcher_naive.dispatch(input_tensor, sizes)
@@ -260,37 +254,60 @@ def run_single_benchmark(num_tokens, hidden_dim, num_experts, device, group_name
         torch.xpu.synchronize()
         dist.barrier()
         
-        start_time = time.perf_counter()
-        for i in range(iterations):
-            if use_xpu_events:
-                naive_begin_events[i].record()
-            gathered = dispatcher_naive.dispatch(input_tensor, sizes)
-            output_naive = dispatcher_naive.combine(gathered, sizes)
-            if use_xpu_events:
-                naive_end_events[i].record()
-        
-        torch.xpu.synchronize()
-        dist.barrier()
-        end_time = time.perf_counter()
-        
-        naive_e2e = (end_time - start_time) / iterations * 1000
-        results["naive_e2e_ms"] = naive_e2e
-        
         if use_xpu_events:
-            naive_xpu_times = [naive_begin_events[i].elapsed_time(naive_end_events[i]) for i in range(iterations)]
-            naive_xpu_avg = sum(naive_xpu_times) / len(naive_xpu_times)
-            naive_xpu_min = min(naive_xpu_times)
-            naive_xpu_max = max(naive_xpu_times)
-            results["naive_xpu_avg_ms"] = naive_xpu_avg
-            results["naive_xpu_min_ms"] = naive_xpu_min
-            results["naive_xpu_max_ms"] = naive_xpu_max
+            # Use XPU events for precise GPU timing
+            for i in range(iterations):
+                naive_dispatch_begin[i].record()
+                gathered = dispatcher_naive.dispatch(input_tensor, sizes)
+                naive_dispatch_end[i].record()
+                naive_combine_begin[i].record()
+                output_naive = dispatcher_naive.combine(gathered, sizes)
+                naive_combine_end[i].record()
+            
+            torch.xpu.synchronize()
+            dist.barrier()
+            
+            naive_dispatch_times = [naive_dispatch_begin[i].elapsed_time(naive_dispatch_end[i]) for i in range(iterations)]
+            naive_combine_times = [naive_combine_begin[i].elapsed_time(naive_combine_end[i]) for i in range(iterations)]
+            naive_total_times = [d + c for d, c in zip(naive_dispatch_times, naive_combine_times)]
+            
+            results["naive_dispatch_avg_ms"] = sum(naive_dispatch_times) / len(naive_dispatch_times)
+            results["naive_combine_avg_ms"] = sum(naive_combine_times) / len(naive_combine_times)
+            results["naive_xpu_avg_ms"] = sum(naive_total_times) / len(naive_total_times)
+            results["naive_xpu_min_ms"] = min(naive_total_times)
+            results["naive_xpu_max_ms"] = max(naive_total_times)
+            results["naive_e2e_ms"] = results["naive_xpu_avg_ms"]
         else:
-            results["naive_xpu_avg_ms"] = naive_e2e  # Use E2E as fallback
+            # Use CPU timing (less precise but works without events)
+            dispatch_times = []
+            combine_times = []
+            
+            for i in range(iterations):
+                torch.xpu.synchronize()
+                t0 = time.perf_counter()
+                gathered = dispatcher_naive.dispatch(input_tensor, sizes)
+                torch.xpu.synchronize()
+                t1 = time.perf_counter()
+                output_naive = dispatcher_naive.combine(gathered, sizes)
+                torch.xpu.synchronize()
+                t2 = time.perf_counter()
+                
+                dispatch_times.append((t1 - t0) * 1000)
+                combine_times.append((t2 - t1) * 1000)
+            
+            dist.barrier()
+            
+            results["naive_dispatch_avg_ms"] = sum(dispatch_times) / len(dispatch_times)
+            results["naive_combine_avg_ms"] = sum(combine_times) / len(combine_times)
+            results["naive_xpu_avg_ms"] = results["naive_dispatch_avg_ms"] + results["naive_combine_avg_ms"]
+            results["naive_e2e_ms"] = results["naive_xpu_avg_ms"]
             results["naive_xpu_min_ms"] = float('nan')
             results["naive_xpu_max_ms"] = float('nan')
     except Exception as e:
         results["naive_error"] = str(e)
         results["naive_e2e_ms"] = float('inf')
+        results["naive_dispatch_avg_ms"] = float('inf')
+        results["naive_combine_avg_ms"] = float('inf')
         results["naive_xpu_avg_ms"] = float('inf')
     
     dist.barrier()
@@ -300,6 +317,12 @@ def run_single_benchmark(num_tokens, hidden_dim, num_experts, device, group_name
     # =====================================================
     dispatcher_agrs = AgRsAll2AllManager(group=dist.group.WORLD)
     
+    if use_xpu_events:
+        agrs_dispatch_begin = [torch.xpu.Event(enable_timing=True) for _ in range(iterations)]
+        agrs_dispatch_end = [torch.xpu.Event(enable_timing=True) for _ in range(iterations)]
+        agrs_combine_begin = [torch.xpu.Event(enable_timing=True) for _ in range(iterations)]
+        agrs_combine_end = [torch.xpu.Event(enable_timing=True) for _ in range(iterations)]
+    
     try:
         for _ in range(warmup):
             gathered = dispatcher_agrs.dispatch(input_tensor, sizes)
@@ -308,37 +331,60 @@ def run_single_benchmark(num_tokens, hidden_dim, num_experts, device, group_name
         torch.xpu.synchronize()
         dist.barrier()
         
-        start_time = time.perf_counter()
-        for i in range(iterations):
-            if use_xpu_events:
-                agrs_begin_events[i].record()
-            gathered = dispatcher_agrs.dispatch(input_tensor, sizes)
-            output_agrs = dispatcher_agrs.combine(gathered, sizes)
-            if use_xpu_events:
-                agrs_end_events[i].record()
-        
-        torch.xpu.synchronize()
-        dist.barrier()
-        end_time = time.perf_counter()
-        
-        agrs_e2e = (end_time - start_time) / iterations * 1000
-        results["agrs_e2e_ms"] = agrs_e2e
-        
         if use_xpu_events:
-            agrs_xpu_times = [agrs_begin_events[i].elapsed_time(agrs_end_events[i]) for i in range(iterations)]
-            agrs_xpu_avg = sum(agrs_xpu_times) / len(agrs_xpu_times)
-            agrs_xpu_min = min(agrs_xpu_times)
-            agrs_xpu_max = max(agrs_xpu_times)
-            results["agrs_xpu_avg_ms"] = agrs_xpu_avg
-            results["agrs_xpu_min_ms"] = agrs_xpu_min
-            results["agrs_xpu_max_ms"] = agrs_xpu_max
+            # Use XPU events for precise GPU timing
+            for i in range(iterations):
+                agrs_dispatch_begin[i].record()
+                gathered = dispatcher_agrs.dispatch(input_tensor, sizes)
+                agrs_dispatch_end[i].record()
+                agrs_combine_begin[i].record()
+                output_agrs = dispatcher_agrs.combine(gathered, sizes)
+                agrs_combine_end[i].record()
+            
+            torch.xpu.synchronize()
+            dist.barrier()
+            
+            agrs_dispatch_times = [agrs_dispatch_begin[i].elapsed_time(agrs_dispatch_end[i]) for i in range(iterations)]
+            agrs_combine_times = [agrs_combine_begin[i].elapsed_time(agrs_combine_end[i]) for i in range(iterations)]
+            agrs_total_times = [d + c for d, c in zip(agrs_dispatch_times, agrs_combine_times)]
+            
+            results["agrs_dispatch_avg_ms"] = sum(agrs_dispatch_times) / len(agrs_dispatch_times)
+            results["agrs_combine_avg_ms"] = sum(agrs_combine_times) / len(agrs_combine_times)
+            results["agrs_xpu_avg_ms"] = sum(agrs_total_times) / len(agrs_total_times)
+            results["agrs_xpu_min_ms"] = min(agrs_total_times)
+            results["agrs_xpu_max_ms"] = max(agrs_total_times)
+            results["agrs_e2e_ms"] = results["agrs_xpu_avg_ms"]
         else:
-            results["agrs_xpu_avg_ms"] = agrs_e2e  # Use E2E as fallback
+            # Use CPU timing
+            dispatch_times = []
+            combine_times = []
+            
+            for i in range(iterations):
+                torch.xpu.synchronize()
+                t0 = time.perf_counter()
+                gathered = dispatcher_agrs.dispatch(input_tensor, sizes)
+                torch.xpu.synchronize()
+                t1 = time.perf_counter()
+                output_agrs = dispatcher_agrs.combine(gathered, sizes)
+                torch.xpu.synchronize()
+                t2 = time.perf_counter()
+                
+                dispatch_times.append((t1 - t0) * 1000)
+                combine_times.append((t2 - t1) * 1000)
+            
+            dist.barrier()
+            
+            results["agrs_dispatch_avg_ms"] = sum(dispatch_times) / len(dispatch_times)
+            results["agrs_combine_avg_ms"] = sum(combine_times) / len(combine_times)
+            results["agrs_xpu_avg_ms"] = results["agrs_dispatch_avg_ms"] + results["agrs_combine_avg_ms"]
+            results["agrs_e2e_ms"] = results["agrs_xpu_avg_ms"]
             results["agrs_xpu_min_ms"] = float('nan')
             results["agrs_xpu_max_ms"] = float('nan')
     except Exception as e:
         results["agrs_error"] = str(e)
         results["agrs_e2e_ms"] = float('inf')
+        results["agrs_dispatch_avg_ms"] = float('inf')
+        results["agrs_combine_avg_ms"] = float('inf')
         results["agrs_xpu_avg_ms"] = float('inf')
     
     dist.barrier()
@@ -346,6 +392,12 @@ def run_single_benchmark(num_tokens, hidden_dim, num_experts, device, group_name
     # =====================================================
     # Benchmark ISHMEMDispatcher
     # =====================================================
+    if use_xpu_events:
+        ishmem_dispatch_begin = [torch.xpu.Event(enable_timing=True) for _ in range(iterations)]
+        ishmem_dispatch_end = [torch.xpu.Event(enable_timing=True) for _ in range(iterations)]
+        ishmem_combine_begin = [torch.xpu.Event(enable_timing=True) for _ in range(iterations)]
+        ishmem_combine_end = [torch.xpu.Event(enable_timing=True) for _ in range(iterations)]
+    
     try:
         dispatcher_ishmem = ISHMEMDispatcher(
             group_name=group_name,
@@ -363,37 +415,60 @@ def run_single_benchmark(num_tokens, hidden_dim, num_experts, device, group_name
         torch.xpu.synchronize()
         dist.barrier()
         
-        start_time = time.perf_counter()
-        for i in range(iterations):
-            if use_xpu_events:
-                ishmem_begin_events[i].record()
-            gathered = dispatcher_ishmem.dispatch(input_tensor, splits)
-            output_ishmem = dispatcher_ishmem.combine()
-            if use_xpu_events:
-                ishmem_end_events[i].record()
-        
-        torch.xpu.synchronize()
-        dist.barrier()
-        end_time = time.perf_counter()
-        
-        ishmem_e2e = (end_time - start_time) / iterations * 1000
-        results["ishmem_e2e_ms"] = ishmem_e2e
-        
         if use_xpu_events:
-            ishmem_xpu_times = [ishmem_begin_events[i].elapsed_time(ishmem_end_events[i]) for i in range(iterations)]
-            ishmem_xpu_avg = sum(ishmem_xpu_times) / len(ishmem_xpu_times)
-            ishmem_xpu_min = min(ishmem_xpu_times)
-            ishmem_xpu_max = max(ishmem_xpu_times)
-            results["ishmem_xpu_avg_ms"] = ishmem_xpu_avg
-            results["ishmem_xpu_min_ms"] = ishmem_xpu_min
-            results["ishmem_xpu_max_ms"] = ishmem_xpu_max
+            # Use XPU events for precise GPU timing
+            for i in range(iterations):
+                ishmem_dispatch_begin[i].record()
+                gathered = dispatcher_ishmem.dispatch(input_tensor, splits)
+                ishmem_dispatch_end[i].record()
+                ishmem_combine_begin[i].record()
+                output_ishmem = dispatcher_ishmem.combine()
+                ishmem_combine_end[i].record()
+            
+            torch.xpu.synchronize()
+            dist.barrier()
+            
+            ishmem_dispatch_times = [ishmem_dispatch_begin[i].elapsed_time(ishmem_dispatch_end[i]) for i in range(iterations)]
+            ishmem_combine_times = [ishmem_combine_begin[i].elapsed_time(ishmem_combine_end[i]) for i in range(iterations)]
+            ishmem_total_times = [d + c for d, c in zip(ishmem_dispatch_times, ishmem_combine_times)]
+            
+            results["ishmem_dispatch_avg_ms"] = sum(ishmem_dispatch_times) / len(ishmem_dispatch_times)
+            results["ishmem_combine_avg_ms"] = sum(ishmem_combine_times) / len(ishmem_combine_times)
+            results["ishmem_xpu_avg_ms"] = sum(ishmem_total_times) / len(ishmem_total_times)
+            results["ishmem_xpu_min_ms"] = min(ishmem_total_times)
+            results["ishmem_xpu_max_ms"] = max(ishmem_total_times)
+            results["ishmem_e2e_ms"] = results["ishmem_xpu_avg_ms"]
         else:
-            results["ishmem_xpu_avg_ms"] = ishmem_e2e  # Use E2E as fallback
+            # Use CPU timing
+            dispatch_times = []
+            combine_times = []
+            
+            for i in range(iterations):
+                torch.xpu.synchronize()
+                t0 = time.perf_counter()
+                gathered = dispatcher_ishmem.dispatch(input_tensor, splits)
+                torch.xpu.synchronize()
+                t1 = time.perf_counter()
+                output_ishmem = dispatcher_ishmem.combine()
+                torch.xpu.synchronize()
+                t2 = time.perf_counter()
+                
+                dispatch_times.append((t1 - t0) * 1000)
+                combine_times.append((t2 - t1) * 1000)
+            
+            dist.barrier()
+            
+            results["ishmem_dispatch_avg_ms"] = sum(dispatch_times) / len(dispatch_times)
+            results["ishmem_combine_avg_ms"] = sum(combine_times) / len(combine_times)
+            results["ishmem_xpu_avg_ms"] = results["ishmem_dispatch_avg_ms"] + results["ishmem_combine_avg_ms"]
+            results["ishmem_e2e_ms"] = results["ishmem_xpu_avg_ms"]
             results["ishmem_xpu_min_ms"] = float('nan')
             results["ishmem_xpu_max_ms"] = float('nan')
     except Exception as e:
         results["ishmem_error"] = str(e)
         results["ishmem_e2e_ms"] = float('inf')
+        results["ishmem_dispatch_avg_ms"] = float('inf')
+        results["ishmem_combine_avg_ms"] = float('inf')
         results["ishmem_xpu_avg_ms"] = float('inf')
     
     dist.barrier()
@@ -428,8 +503,8 @@ def generate_markdown_table(all_results):
     lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     lines.append("")
     
-    # Main comparison table with all three methods
-    lines.append("### Performance Comparison (E2E time in ms)")
+    # Main comparison table with total times
+    lines.append("### Total Time Comparison (ms)")
     lines.append("")
     lines.append("| num_tokens | hidden_dim | Naive | AgRs | ISHMEM | Naive/ISHMEM | AgRs/ISHMEM |")
     lines.append("|------------|------------|-------|------|--------|--------------|-------------|")
@@ -451,6 +526,44 @@ def generate_markdown_table(all_results):
     
     lines.append("")
     
+    # Dispatch time breakdown
+    lines.append("### Dispatch Time Breakdown (ms)")
+    lines.append("")
+    lines.append("| num_tokens | hidden_dim | Naive | AgRs | ISHMEM |")
+    lines.append("|------------|------------|-------|------|--------|")
+    
+    for r in all_results:
+        naive_disp = r.get("naive_dispatch_avg_ms", float('inf'))
+        agrs_disp = r.get("agrs_dispatch_avg_ms", float('inf'))
+        ishmem_disp = r.get("ishmem_dispatch_avg_ms", float('inf'))
+        
+        naive_str = f"{naive_disp:.3f}" if naive_disp < float('inf') else "FAIL"
+        agrs_str = f"{agrs_disp:.3f}" if agrs_disp < float('inf') else "FAIL"
+        ishmem_str = f"{ishmem_disp:.3f}" if ishmem_disp < float('inf') else "FAIL"
+        
+        lines.append(f"| {r['num_tokens']:>10} | {r['hidden_dim']:>10} | {naive_str:>5} | {agrs_str:>4} | {ishmem_str:>6} |")
+    
+    lines.append("")
+    
+    # Combine time breakdown
+    lines.append("### Combine Time Breakdown (ms)")
+    lines.append("")
+    lines.append("| num_tokens | hidden_dim | Naive | AgRs | ISHMEM |")
+    lines.append("|------------|------------|-------|------|--------|")
+    
+    for r in all_results:
+        naive_comb = r.get("naive_combine_avg_ms", float('inf'))
+        agrs_comb = r.get("agrs_combine_avg_ms", float('inf'))
+        ishmem_comb = r.get("ishmem_combine_avg_ms", float('inf'))
+        
+        naive_str = f"{naive_comb:.3f}" if naive_comb < float('inf') else "FAIL"
+        agrs_str = f"{agrs_comb:.3f}" if agrs_comb < float('inf') else "FAIL"
+        ishmem_str = f"{ishmem_comb:.3f}" if ishmem_comb < float('inf') else "FAIL"
+        
+        lines.append(f"| {r['num_tokens']:>10} | {r['hidden_dim']:>10} | {naive_str:>5} | {agrs_str:>4} | {ishmem_str:>6} |")
+    
+    lines.append("")
+    
     # Legend
     lines.append("**Legend:**")
     lines.append("- **Naive**: Broadcast (dispatch) + AllReduce (combine)")
@@ -467,9 +580,9 @@ def generate_csv(all_results):
     lines = []
     headers = [
         "num_tokens", "hidden_dim", "num_experts", "local_tokens", "world_size",
-        "naive_e2e_ms", "naive_xpu_avg_ms",
-        "agrs_e2e_ms", "agrs_xpu_avg_ms",
-        "ishmem_e2e_ms", "ishmem_xpu_avg_ms",
+        "naive_e2e_ms", "naive_dispatch_avg_ms", "naive_combine_avg_ms", "naive_xpu_avg_ms",
+        "agrs_e2e_ms", "agrs_dispatch_avg_ms", "agrs_combine_avg_ms", "agrs_xpu_avg_ms",
+        "ishmem_e2e_ms", "ishmem_dispatch_avg_ms", "ishmem_combine_avg_ms", "ishmem_xpu_avg_ms",
         "naive_vs_ishmem", "agrs_vs_ishmem"
     ]
     lines.append(",".join(headers))
