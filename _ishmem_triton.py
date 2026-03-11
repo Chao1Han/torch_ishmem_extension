@@ -25,6 +25,7 @@ class NvshmemLibFinder:
 
     # Class variable to store the found library path for reuse
     found_device_lib_path: str | None = None
+    found_extension_device_lib_path: str | None = None
 
     @classmethod
     def find_device_library(cls) -> str:
@@ -97,6 +98,43 @@ class NvshmemLibFinder:
                 return device_lib
 
         raise RuntimeError(f"NVSHMEM device library not found. Searched: {paths}")
+
+    @classmethod
+    def find_extension_device_library(cls) -> str:
+        if cls.found_extension_device_lib_path is not None:
+            return cls.found_extension_device_lib_path
+
+        explicit_path = os.environ.get("TORCH_ISHMEM_DEVICE_LIB_PATH")
+        if explicit_path is not None:
+            if not os.path.exists(explicit_path):
+                raise RuntimeError(
+                    "Torch ISHMEM device library not found at specified path: "
+                    f"{explicit_path}"
+                )
+            cls.found_extension_device_lib_path = explicit_path
+            return explicit_path
+
+        candidates = [
+            os.path.join(os.path.dirname(__file__), "libtorch_ishmem_device.bc"),
+        ]
+
+        for candidate in candidates:
+            if os.path.exists(candidate):
+                cls.found_extension_device_lib_path = candidate
+                return candidate
+
+        raise RuntimeError(
+            "Torch ISHMEM device library not found. Searched: "
+            f"{candidates}. Build the repository so libtorch_ishmem_device.bc exists, "
+            "or set TORCH_ISHMEM_DEVICE_LIB_PATH."
+        )
+
+    @classmethod
+    def find_extern_libraries(cls) -> dict[str, str]:
+        return {
+            "libnvshmem_device": cls.find_device_library(),
+            "libtorch_ishmem_device": cls.find_extension_device_library(),
+        }
 
 
 def enable_triton(lib_dir: str | None = None) -> dict[str, str]:
@@ -226,9 +264,8 @@ def requires_nvshmem(  # type: ignore[no-untyped-def]
     if not isinstance(jit_func, JITFunction):
         raise TypeError(f"Expected a JITFunction, but got {type(jit_func)}")
 
-    # Find the NVSHMEM device library
-    lib_path = NvshmemLibFinder.find_device_library()
-    extern_libs = {"libnvshmem_device": lib_path}
+    # Find the NVSHMEM device library and the local Triton wrapper bitcode.
+    extern_libs = NvshmemLibFinder.find_extern_libraries()
 
     # Register the JITFunction with the kernel registry as "to be initialized"
     NvshmemKernelRegistry.register(jit_func.fn.__name__)

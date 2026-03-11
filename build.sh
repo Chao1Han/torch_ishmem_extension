@@ -23,6 +23,7 @@ if [ "$1" == "clean" ]; then
     echo "Cleaning build artifacts..."
     rm -rf build dist *.egg-info
     find . -name "*.so" -delete
+    find . -name "*.bc" -delete
     find . -name "*.o" -delete
     find . -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
     echo "Clean complete"
@@ -44,4 +45,5 @@ python setup.py develop
 
 echo ""
 echo "Build complete!"
+echo "Generated device bitcode: ./libtorch_ishmem_device.bc"
 echo "You can now import torch_ishmem_extension in Python"

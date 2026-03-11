@@ -2,6 +2,7 @@
 # To run:
 # python test/distributed/test_nvshmem_triton.py
 
+import os
 import sys
 import triton.language as tl
 
@@ -9,7 +10,7 @@ import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 from torch._inductor.runtime.triton_compat import triton
-# from torch.distributed._symmetric_memory._nvshmem_triton import requires_nvshmem
+from _ishmem_triton import requires_nvshmem
 from torch.testing._internal.common_distributed import MultiProcContinuousTest
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
@@ -21,12 +22,16 @@ from torch.testing._internal.common_utils import (
 from torch.testing._internal.inductor_utils import IS_H100, requires_triton
 import _ishmem_triton as ishmem
 
+#initialize
 
-def requires_h100():
-    return skip_but_pass_in_sandcastle_if(
-        not IS_H100,
-        "NVSHMEM requires H100. Skipping test on non-H100 GPU.",
-    )
+os.environ['RANK'] = str(os.environ.get('PMI_RANK', 0))
+os.environ['WORLD_SIZE'] = str(os.environ.get('PMI_SIZE', 1))
+os.environ['MASTER_ADDR'] = '127.0.0.1'
+os.environ['MASTER_PORT'] = '29800'
+
+os.environ['TORCH_SYMMMEM'] = 'ISHMEM'
+dist.init_process_group(backend="xccl")
+os.environ['ZE_AFFINITY_MASK'] = str(dist.get_rank())
 
 
 # So that tests are written in device-agnostic way
@@ -259,12 +264,7 @@ def my_reduce_kernel(
 class ISHMEMTritonTest():
     def __init__(self):
         # ISHMEM specific environment setup
-        os.environ['TORCH_SYMMMEM'] = 'ISHMEM'
-        os.environ['MASTER_ADDR'] = 'localhost'
-        os.environ['MASTER_PORT'] = '12355'
-        dist.init_process_group(backend="xccl")
-        rank = dist.rank
-        os.environ['ZE_AFFINITY_MASK'] = str(rank)
+        self.rank = dist.get_rank()
         device_module.set_device(self.device)
 
     def _init_device(self) -> None:
@@ -324,7 +324,7 @@ class ISHMEMTritonTest():
                 dst, torch.tensor(expected, device=self.device, dtype=dtype)
             )
 
-    def test_triton_get(self, nbi: bool = True) -> None:
+    def test_triton_get(self, nbi: bool = False) -> None:
         torch.manual_seed(42 + self.rank)
         self._init_device()
 
@@ -336,15 +336,18 @@ class ISHMEMTritonTest():
         dtype = torch.int8
         val = 7
 
-        # Create symmetric tensors
+        print("Start to create symmetric tensors \n", flush=True)
         inp = symm_mem.empty(numel, dtype=dtype, device=self.device).fill_(
             val if rank == 0 else -1
         )
         out = symm_mem.empty(numel, dtype=dtype, device=self.device).fill_(-1)
+        
+        print("Start to rendezvous \n", flush=True)
         symm_mem.rendezvous(inp, group=group_name)
         symm_mem.rendezvous(out, group=group_name)
 
         dist.barrier()
+        print("Start to call triton kernel \n", flush=True)
         peer = 1 - rank
         if rank == 1:
             # Rank 1 gets data from rank 0 using tensor-aware API
@@ -361,9 +364,13 @@ class ISHMEMTritonTest():
             )
 
 def main():
-    ISHMEMTritonTest.__init__()
-    ISHMEMTritonTest.test_triton_get()
-    ISHMEMTritonTest.test_triton_put()
+    test = ISHMEMTritonTest()
+    try:
+        test.test_triton_get()
+        test.test_triton_put()
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 if __name__ == "__main__":
     main()
