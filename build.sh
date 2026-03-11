@@ -45,5 +45,5 @@ python setup.py develop
 
 echo ""
 echo "Build complete!"
-echo "Generated device bitcode: ./libtorch_ishmem_device.bc"
+echo "Generated device bitcode: ./libishmem_device.bc"
 echo "You can now import torch_ishmem_extension in Python"

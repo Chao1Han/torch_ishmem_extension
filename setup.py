@@ -11,7 +11,7 @@ os.environ['CC'] = 'icx'
 
 REPO_ROOT = Path(__file__).resolve().parent
 DEVICE_WRAPPER_SOURCE = REPO_ROOT / 'ishmem_wrapper.cpp'
-DEVICE_WRAPPER_BC = REPO_ROOT / 'libtorch_ishmem_device.bc'
+DEVICE_WRAPPER_BC = REPO_ROOT / 'libishmem_device.bc'
 HOST_EXTENSION_SOURCES = ['ishmem_extension.cpp', 'binding.cpp']
 
 # Get environment variables

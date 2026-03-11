@@ -220,11 +220,11 @@ def test_find_device_library_uses_env_var() -> None:
     try:
         finder.found_device_lib_path = None
         with tempfile.TemporaryDirectory() as tmpdir:
-            lib_path = os.path.join(tmpdir, "libnvshmem_device.bc")
+            lib_path = os.path.join(tmpdir, "libishmem_device.bc")
             with open(lib_path, "w", encoding="utf-8") as handle:
                 handle.write("test")
 
-            with patch.dict(os.environ, {"NVSHMEM_LIB_DIR": tmpdir}, clear=False):
+            with patch.dict(os.environ, {"ISHMEM_LIB_DIR": tmpdir}, clear=False):
                 found = finder.find_device_library()
                 assert found == lib_path
                 assert finder.found_device_lib_path == lib_path
@@ -239,7 +239,7 @@ def test_find_extension_device_library_uses_explicit_env_path() -> None:
     try:
         finder.found_extension_device_lib_path = None
         with tempfile.TemporaryDirectory() as tmpdir:
-            lib_path = os.path.join(tmpdir, "libtorch_ishmem_device.bc")
+            lib_path = os.path.join(tmpdir, "libishmem_device.bc")
             with open(lib_path, "w", encoding="utf-8") as handle:
                 handle.write("test")
 
@@ -264,7 +264,7 @@ def test_find_extension_device_library_falls_back_to_repo_local_bitcode() -> Non
     try:
         finder.found_extension_device_lib_path = None
         with tempfile.TemporaryDirectory() as tmpdir:
-            lib_path = os.path.join(tmpdir, "libtorch_ishmem_device.bc")
+            lib_path = os.path.join(tmpdir, "libishmem_device.bc")
             with open(lib_path, "w", encoding="utf-8") as handle:
                 handle.write("test")
 
@@ -284,24 +284,24 @@ def test_find_extension_device_library_falls_back_to_repo_local_bitcode() -> Non
             os.environ["TORCH_ISHMEM_DEVICE_LIB_PATH"] = previous_env
 
 
-def test_find_extern_libraries_returns_nvshmem_and_local_wrapper() -> None:
+def test_find_extern_libraries_returns_ishmem_and_local_wrapper() -> None:
     with (
         patch.object(
             ishmem_triton.NvshmemLibFinder,
             "find_device_library",
-            return_value="/tmp/libnvshmem_device.bc",
+            return_value="/tmp/upstream/libishmem_device.bc",
         ),
         patch.object(
             ishmem_triton.NvshmemLibFinder,
             "find_extension_device_library",
-            return_value="/tmp/libtorch_ishmem_device.bc",
+            return_value="/tmp/local/libishmem_device.bc",
         ),
     ):
         extern_libs = ishmem_triton.NvshmemLibFinder.find_extern_libraries()
 
     assert extern_libs == {
-        "libnvshmem_device": "/tmp/libnvshmem_device.bc",
-        "libtorch_ishmem_device": "/tmp/libtorch_ishmem_device.bc",
+        "libishmem_device": "/tmp/upstream/libishmem_device.bc",
+        "libishmem_triton_wrapper": "/tmp/local/libishmem_device.bc",
     }
 
 
@@ -312,13 +312,13 @@ def test_find_device_library_raises_for_missing_env_target() -> None:
     try:
         finder.found_device_lib_path = None
         with tempfile.TemporaryDirectory() as tmpdir:
-            with patch.dict(os.environ, {"NVSHMEM_LIB_DIR": tmpdir}, clear=False):
+            with patch.dict(os.environ, {"ISHMEM_LIB_DIR": tmpdir}, clear=False):
                 try:
                     finder.find_device_library()
                 except RuntimeError as exc:
-                    assert "NVSHMEM device library not found at specified path" in str(exc)
+                    assert "ISHMEM device library not found at specified path" in str(exc)
                 else:
-                    assert False, "Expected RuntimeError for missing NVSHMEM device library"
+                    assert False, "Expected RuntimeError for missing ISHMEM device library"
     finally:
         finder.found_device_lib_path = previous
 
@@ -335,8 +335,8 @@ def test_grid_callable_with_extern_forwards_extern_libs() -> None:
             return "ok"
 
     extern_libs = {
-        "libnvshmem_device": "/tmp/libnvshmem_device.bc",
-        "libtorch_ishmem_device": "/tmp/libtorch_ishmem_device.bc",
+        "libishmem_device": "/tmp/upstream/libishmem_device.bc",
+        "libishmem_triton_wrapper": "/tmp/local/libishmem_device.bc",
     }
     wrapper = ishmem_triton.GridCallableWithExtern(FakeJitFunc(), extern_libs)
 
@@ -394,8 +394,8 @@ def test_requires_nvshmem_registers_kernel_and_sets_hook() -> None:
                 ishmem_triton.NvshmemLibFinder,
                 "find_extern_libraries",
                 return_value={
-                    "libnvshmem_device": "/tmp/libnvshmem_device.bc",
-                    "libtorch_ishmem_device": "/tmp/libtorch_ishmem_device.bc",
+                    "libishmem_device": "/tmp/upstream/libishmem_device.bc",
+                    "libishmem_triton_wrapper": "/tmp/local/libishmem_device.bc",
                 },
             ),
             patch.object(ishmem_triton.NvshmemKernelRegistry, "register") as register_mock,
@@ -415,8 +415,8 @@ def test_requires_nvshmem_registers_kernel_and_sets_hook() -> None:
                     {
                         "flag": True,
                         "extern_libs": {
-                            "libnvshmem_device": "/tmp/libnvshmem_device.bc",
-                            "libtorch_ishmem_device": "/tmp/libtorch_ishmem_device.bc",
+                            "libishmem_device": "/tmp/upstream/libishmem_device.bc",
+                            "libishmem_triton_wrapper": "/tmp/local/libishmem_device.bc",
                         },
                     },
                 )
