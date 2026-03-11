@@ -83,7 +83,7 @@ setup(
     ext_modules=[
         CppExtension(
             name='torch_ishmem_extension',
-            sources=['ishmem_extension.cpp', 'binding.cpp'],
+            sources=['ishmem_extension.cpp', 'ishmem_wrapper.cpp', 'binding.cpp'],
             include_dirs=include_dirs,
             library_dirs=library_dirs,
             libraries=libraries,
