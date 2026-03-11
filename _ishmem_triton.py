@@ -386,7 +386,7 @@ if has_triton():
         """
         tl.static_assert(dest.type == source.type)
         nbytes = nelems * dest.type.element_ty.itemsize
-        return getmem_block_extern_wrapper(
+        return getmem_nbi_block_extern_wrapper(
             dest.to(tl.int64), source.to(tl.int64), nbytes.to(tl.int64), pe
         )
 
