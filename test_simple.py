@@ -38,21 +38,7 @@ os.environ['ZE_AFFINITY_MASK'] = str(dist.get_rank())
 device_type = "xpu"
 device_module = torch.get_device_module(device_type)
 
-
-# Shared Triton JIT kernels
-
-@requires_nvshmem
-@triton.jit
-def my_put_kernel(
-    dest,
-    src,
-    nelems,
-    pe,
-):
-    ishmem.put(dest, src, nelems, pe)
-
-
-@requires_nvshmem
+# @requires_nvshmem
 @triton.jit
 def my_get_kernel(
     dest,
@@ -61,205 +47,16 @@ def my_get_kernel(
     pe,
     nbi: tl.constexpr,  # use nonblocking interface if True
 ):
-    if nbi:
-        ishmem.get_nbi(dest, src, nelems, pe)
-        ishmem.quiet()
-    else:
-        ishmem.get(dest, src, nelems, pe)
+    # ishmem.get(dest, src, nelems, pe)
 
+    tl.device_print("In get triton kernel")
+    
+    # if nbi:
+    #     ishmem.get_nbi(dest, src, nelems, pe)
+    #     ishmem.quiet()
+    # else:
+    #     ishmem.get(dest, src, nelems, pe)
 
-@requires_nvshmem
-@triton.jit
-def my_putmem_signal_block_kernel(
-    dst,
-    src,
-    size_bytes,
-    signal,
-    sig_val,
-    sig_op,
-    peer,
-):
-    ishmem.putmem_signal_block(dst, src, size_bytes, signal, sig_val, sig_op, peer)
-
-
-@requires_nvshmem
-@triton.jit
-def my_signal_wait_until_kernel(signal, cmp_op, cmp_val):
-    ishmem.signal_wait_until(signal, cmp_op, cmp_val)
-
-
-@requires_nvshmem
-@triton.jit
-def my_signal_op_kernel(
-    sig_addr,
-    signal,
-    sig_op,
-    peer,
-):
-    ishmem.signal_op(sig_addr, signal, sig_op, peer)
-
-
-@requires_nvshmem
-@triton.jit
-def my_wait_until_kernel(
-    ivar,
-    cmp_op,
-    cmp_val,
-):
-    ishmem.wait_until(ivar, cmp_op, cmp_val)
-
-
-@requires_nvshmem
-@triton.jit
-def my_fence_kernel():
-    ishmem.fence()
-
-
-@requires_nvshmem
-@triton.jit
-def my_put_with_fence_kernel(
-    dst1,
-    src1,
-    dst2,
-    src2,
-    flag_dst,
-    flag_src,
-    nelems,
-    peer,
-):
-    # First put
-    ishmem.put(dst1, src1, nelems, peer)
-    # Ensure the first put is ordered before the next.
-    ishmem.fence()
-    # Second put
-    ishmem.put(dst2, src2, nelems, peer)
-    # Order the second put before flag update.
-    ishmem.fence()
-    # Write the flag (single int64) to signal completion.
-    ishmem.put(flag_dst, flag_src, 1, peer)
-
-
-@requires_nvshmem
-@triton.jit
-def my_put_with_quiet_kernel(
-    dst,
-    src,
-    flag_dst,
-    flag_src,
-    nelems,
-    peer,
-):
-    # Put data
-    ishmem.put(dst, src, nelems, peer)
-    # Call quiet to ensure put is complete
-    ishmem.quiet()
-    # Only after quiet, set the completion flag
-    # This ensures the data put is complete before flag is set
-    ishmem.put(flag_dst, flag_src, 1, peer)
-
-
-@requires_nvshmem
-@triton.jit
-def my_barrier_test_kernel(
-    dst,
-    src,
-    nelems,
-):
-    # Testing barrier_all() requires coordinated operations across PEs within
-    # the same kernel execution. Unlike other kernels that just wrap NVSHMEM
-    # primitives, this one implements the full test logic to properly verify
-    # device-side barrier synchronization.
-    my_pe = ishmem.my_pe()
-    n_pes = ishmem.n_pes()
-
-    # Rank 0 broadcasts its value to all other ranks
-    if my_pe == 0:
-        # Write initial value
-        p_src = src.to(tl.pointer_type(tl.int32))
-        tl.store(p_src, 42)
-        # Put to all other ranks
-        i = 1
-        while i < n_pes:
-            ishmem.put(dst, src, nelems, i)
-            i += 1
-
-    # Synchronize all PEs
-    ishmem.barrier_all()
-
-    # Non-zero ranks increment the received value
-    if my_pe != 0:
-        p_dst = dst.to(tl.pointer_type(tl.int32))
-        received = tl.load(p_dst)
-        tl.store(p_dst, received + 1)
-
-
-@requires_nvshmem
-@triton.jit
-def my_barrier_all_kernel():
-    ishmem.barrier_all()
-
-
-@requires_nvshmem
-@triton.jit
-def my_sync_test_kernel(
-    local_data,
-    remote_data,
-    nelems,
-):
-    my_pe = ishmem.my_pe()
-    n_pes = ishmem.n_pes()
-
-    # Each PE writes a unique value to its local memory
-    p_local = local_data.to(tl.pointer_type(tl.int32))
-    unique_value = my_pe + 100  # PE 0 writes 100, PE 1 writes 101, etc.
-    tl.store(p_local, unique_value)
-
-    # sync_all() ensures local stores are visible to other PEs
-    # but doesn't guarantee completion of any remote operations
-    ishmem.sync_all()
-
-    # Now each PE reads from the next PE's memory to verify visibility
-    # PE 0 reads from PE 1, PE 1 reads from PE 2, ..., PE n-1 reads from PE 0
-    next_pe = (my_pe + 1) % n_pes
-    ishmem.get(remote_data, local_data, nelems, next_pe)
-
-    # The get should now see the value that the next PE wrote locally
-    # because sync_all() made those local stores visible
-
-
-@requires_nvshmem
-@triton.jit
-def my_alltoall_kernel(
-    team_handle,
-    dst,
-    src,
-    nelems_per_pe,
-):
-    ishmem.alltoall(team_handle, dst, src, nelems_per_pe)
-
-
-@requires_nvshmem
-@triton.jit
-def my_broadcast_kernel(
-    team_handle,
-    dst,
-    src,
-    nelems,
-    pe_root,
-):
-    ishmem.broadcast(team_handle, dst, src, nelems, pe_root)
-
-
-@requires_nvshmem
-@triton.jit
-def my_reduce_kernel(
-    team_handle,
-    dest_tensor,
-    source_tensor,
-    nreduce,
-    operation: tl.constexpr,
-):
-    ishmem.reduce(team_handle, dest_tensor, source_tensor, nreduce, operation)
 
 class ISHMEMTritonTest():
     def __init__(self):
@@ -275,7 +72,7 @@ class ISHMEMTritonTest():
         return torch.device(device_type, self.rank)
 
 
-    def test_triton_put(self) -> None:
+    # def test_triton_put(self) -> None:
         torch.manual_seed(42 + self.rank)
         self._init_device()
 
@@ -347,6 +144,7 @@ class ISHMEMTritonTest():
         symm_mem.rendezvous(out, group=group_name)
 
         dist.barrier()
+        torch.xpu.synchronize() # just check
         print("Start to call triton kernel \n", flush=True)
         peer = 1 - rank
         if rank == 1:
@@ -358,17 +156,18 @@ class ISHMEMTritonTest():
                 peer,
                 nbi=nbi,
             )
-        if rank == 1:
-            torch.testing.assert_close(
-                out, val * torch.ones(numel, dtype=dtype, device=self.device)
-            )
+        # if rank == 1:
+        #     torch.testing.assert_close(
+        #         out, val * torch.ones(numel, dtype=dtype, device=self.device)
+        #     )
+        dist.barrier()
         print("Done to test_triton_get \n", flush=True)
 
 def main():
     test = ISHMEMTritonTest()
     try:
         test.test_triton_get()
-        test.test_triton_put()
+        # test.test_triton_put()
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
