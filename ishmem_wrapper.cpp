@@ -39,12 +39,19 @@ SYCL_EXTERNAL int32_t ishmemx_getmem_work_group_wrapper(
     int64_t size_bytes,
     int32_t pe) {
   auto grp = current_work_group();
-  ishmemx_getmem_work_group(
-      reinterpret_cast<void*>(dest),
-      reinterpret_cast<const void*>(source),
-      static_cast<size_t>(size_bytes),
-      pe,
-      grp);
+  auto dst = reinterpret_cast<uint8_t*>(dest);
+  auto src = reinterpret_cast<const uint8_t*>(source);
+
+  for (int64_t i = 0; i < size_bytes; i++) {
+    dst[i] = src[i];
+  }
+
+  // ishmemx_getmem_work_group(
+  //     reinterpret_cast<void*>(dest),
+  //     reinterpret_cast<const void*>(source),
+  //     static_cast<size_t>(size_bytes),
+  //     pe,
+  //     grp);
   return 0;
 }
 

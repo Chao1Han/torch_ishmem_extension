@@ -362,6 +362,7 @@ class ISHMEMTritonTest():
             torch.testing.assert_close(
                 out, val * torch.ones(numel, dtype=dtype, device=self.device)
             )
+        print("Done to test_triton_get \n", flush=True)
 
 def main():
     test = ISHMEMTritonTest()
